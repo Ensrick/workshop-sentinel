@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>WorkshopSentinel</RootNamespace>
+    <AssemblyName>WorkshopSentinel</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Exclude the tests subfolder so its .cs / .csproj don't get pulled into the main project's glob. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests\**;bin\**;obj\**</DefaultItemExcludes>
+    <!-- We have our own Main in Program.cs (which dispatches GUI vs CLI). Disable the WPF
+         auto-generated Main + opt out of the App.xaml ApplicationDefinition convention. -->
+    <StartupObject>WorkshopSentinel.Program</StartupObject>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+</Project>
