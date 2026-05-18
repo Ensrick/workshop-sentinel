@@ -15,7 +15,10 @@ public static class CliRunner
     public static int Run(string[] args)
     {
         var (cleaned, flags) = ExtractGlobalFlags(args);
-        if (!flags.NoBanner) PrintBanner();
+        // Auto-suppress the banner when a JSON output flag is present anywhere in argv —
+        // otherwise downstream `ConvertFrom-Json` / `jq` chokes on the leading banner line.
+        var jsonRequested = args.Any(a => string.Equals(a, "--json", StringComparison.OrdinalIgnoreCase));
+        if (!flags.NoBanner && !jsonRequested) PrintBanner();
 
         if (cleaned.Count == 0)
         {

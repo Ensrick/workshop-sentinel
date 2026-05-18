@@ -1,12 +1,629 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Linq;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Input;
+using System.Windows.Media;
+using WorkshopSentinel.Services;
+using WorkshopSentinel.ViewModels;
 
 namespace WorkshopSentinel;
 
 public partial class MainWindow : Window
 {
+    // ---- services (composed once at startup) ----
+    private readonly SettingsStore                 _settingsStore;
+    private readonly SteamPathResolver             _pathResolver;
+    private readonly LibraryFoldersResolver        _libResolver;
+    private readonly WorkshopEnumerator            _enumerator = new();
+    private readonly HttpClient                    _http;
+    private readonly SteamWebApiClient             _api;
+    private readonly FriendSubscriptionsClient     _friendClient;
+    private readonly SteamProcessGuard             _steamGuard = new();
+    private readonly string                        _steamRoot;
+    private readonly IReadOnlyList<string>         _libraryRoots;
+    private readonly AppNameResolver               _names;
+    private readonly RefreshExecutor               _refresher;
+    private readonly SteamFriendsResolver?         _friendsResolver;
+
+    // ---- in-memory state ----
+    private readonly ObservableCollection<GameRow>         _games     = new();
+    private readonly ObservableCollection<AuditedItemRow>  _myMods    = new();
+    private List<WorkshopItemLocal>                        _myModsRaw = new();
+    private readonly List<FriendIdentity>                  _friends   = new();
+    /// <summary>friend.SteamId64 → set of subscribed publishedfileids</summary>
+    private readonly Dictionary<string, HashSet<ulong>>    _friendSubs = new();
+    /// <summary>Steam friend roster (read from localconfig.vdf) for the picker panel.</summary>
+    private readonly ObservableCollection<FriendRow>       _friendRoster = new();
+    private Settings                                       _settings = new();
+
     public MainWindow()
     {
         InitializeComponent();
         VersionLabel.Text = $"v{Program.Version}";
+
+        _settingsStore = new SettingsStore();
+        _settings      = _settingsStore.Load();
+        _pathResolver  = new SteamPathResolver(_settings);
+        _libResolver   = new LibraryFoldersResolver();
+
+        try { _steamRoot = _pathResolver.Resolve(); }
+        catch (SteamNotFoundException ex)
+        {
+            MessageBox.Show(this,
+                "Couldn't find Steam on this machine.\n\n" + ex.Message +
+                "\n\nSet steamRoot in %APPDATA%\\WorkshopSentinel\\settings.json and restart.",
+                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Error);
+            _steamRoot = "";
+        }
+
+        _libraryRoots = _libResolver.Resolve(_steamRoot);
+        _names        = new AppNameResolver(_libraryRoots);
+
+        _http         = BuildHttpClient();
+        _api          = new SteamWebApiClient(_http);
+        _friendClient = new FriendSubscriptionsClient(_http);
+        _refresher    = new RefreshExecutor(_libraryRoots);
+        _friendsResolver = string.IsNullOrEmpty(_steamRoot) ? null : new SteamFriendsResolver(_steamRoot);
+
+        GamesGrid.ItemsSource    = _games;
+        MyModsGrid.ItemsSource   = _myMods;
+        FriendsListBox.ItemsSource = _friendRoster;
+
+        // Initial population
+        Loaded += async (_, _) =>
+        {
+            await ReloadGamesAsync();
+            ReloadFriendRoster();
+        };
+    }
+
+    private static HttpClient BuildHttpClient()
+    {
+        var c = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        c.DefaultRequestHeaders.UserAgent.ParseAdd($"WorkshopSentinel/{Program.Version}");
+        // Some Steam endpoints serve different content based on Accept-Language; pin to en-US so
+        // private-profile detection strings stay predictable across user locales.
+        c.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+        return c;
+    }
+
+    // ===================================================================
+    //  Games tab
+    // ===================================================================
+
+    private async void OnRescanGamesClicked(object sender, RoutedEventArgs e)
+        => await ReloadGamesAsync();
+
+    private async Task ReloadGamesAsync()
+    {
+        if (string.IsNullOrEmpty(_steamRoot)) return;
+
+        SetStatus("Scanning local Workshop manifests…");
+        _games.Clear();
+
+        // 1. Group local items by appid.
+        var byApp = await Task.Run(() =>
+            _enumerator.EnumerateAll(_libraryRoots)
+                .GroupBy(i => i.AppId)
+                .ToDictionary(g => g.Key, g => g.ToList()));
+
+        if (byApp.Count == 0)
+        {
+            SetStatus("No Workshop subscriptions found on this machine.");
+            return;
+        }
+
+        // 2. Fetch live timestamps for every item (one big batched call).
+        SetStatus($"Auditing {byApp.Values.Sum(v => v.Count)} items against the Steam Web API…");
+        var allIds = byApp.Values.SelectMany(v => v.Select(i => i.PublishedFileId));
+        var remotes = await _api.GetPublishedFileDetailsAsync(allIds);
+
+        // 3. Compute (subs, stale) per appid.
+        foreach (var (appId, items) in byApp.OrderBy(kv => _names.Resolve(kv.Key), StringComparer.OrdinalIgnoreCase))
+        {
+            int stale = 0;
+            foreach (var item in items)
+            {
+                remotes.TryGetValue(item.PublishedFileId, out var r);
+                if (StalenessAuditor.Audit(item, r, null).Status == FreshnessStatus.Stale) stale++;
+            }
+            _games.Add(new GameRow
+            {
+                AppId       = appId,
+                Name        = _names.Resolve(appId),
+                SubCount    = items.Count,
+                StaleCount  = stale,
+                LibraryRoot = FindLibraryFor(appId) ?? "",
+            });
+        }
+
+        // Refresh the game dropdowns in the other tabs.
+        var snapshot = _games.ToList();
+        MyModsGameCombo.ItemsSource = snapshot;
+        FriendGameCombo.ItemsSource = snapshot;
+        if (snapshot.Count > 0)
+        {
+            MyModsGameCombo.SelectedIndex = 0;
+            FriendGameCombo.SelectedIndex = 0;
+        }
+
+        var totalStale = _games.Sum(g => g.StaleCount);
+        SetStatus($"{_games.Count} games · {_games.Sum(g => g.SubCount)} subs · {totalStale} stale.");
+    }
+
+    private string? FindLibraryFor(uint appId)
+    {
+        foreach (var root in _libraryRoots)
+        {
+            var acf = System.IO.Path.Combine(root, "steamapps", "workshop", $"appworkshop_{appId}.acf");
+            if (System.IO.File.Exists(acf)) return root;
+        }
+        return null;
+    }
+
+    private void OnGamesGridDoubleClicked(object sender, MouseButtonEventArgs e)
+    {
+        if (GamesGrid.SelectedItem is not GameRow row) return;
+        // Jump to My Mods tab and select that game.
+        MyModsGameCombo.SelectedValue = row.AppId;
+        MainTabs.SelectedIndex = 1;
+    }
+
+    // ===================================================================
+    //  My Mods tab
+    // ===================================================================
+
+    private async void OnMyModsGameChanged(object sender, SelectionChangedEventArgs e)
+    {
+        await AuditSelectedGameAsync();
+    }
+
+    private async void OnAuditClicked(object sender, RoutedEventArgs e)
+        => await AuditSelectedGameAsync(force: true);
+
+    private async Task AuditSelectedGameAsync(bool force = false)
+    {
+        if (MyModsGameCombo.SelectedValue is not uint appId) return;
+
+        SetStatus($"Auditing {_names.Resolve(appId)}…");
+        _myMods.Clear();
+
+        var locals = await Task.Run(() =>
+            _enumerator.EnumerateForApp(_libraryRoots, appId).ToList());
+        _myModsRaw = locals;
+
+        if (locals.Count == 0)
+        {
+            SetStatus("No subscriptions for this game.");
+            return;
+        }
+
+        var remotes = await _api.GetPublishedFileDetailsAsync(locals.Select(l => l.PublishedFileId));
+
+        var rows = locals
+            .Select(l => new AuditedItemRow(StalenessAuditor.Audit(
+                l,
+                remotes.TryGetValue(l.PublishedFileId, out var r) ? r : null,
+                _names.Resolve(appId))))
+            .OrderBy(r => r.Source.Status switch
+            {
+                FreshnessStatus.Stale     => 0,
+                FreshnessStatus.ApiFailed => 1,
+                FreshnessStatus.Unknown   => 2,
+                FreshnessStatus.Removed   => 3,
+                FreshnessStatus.Current   => 4,
+                _ => 5,
+            })
+            .ThenBy(r => r.Title, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        foreach (var r in rows) _myMods.Add(r);
+
+        var stale = rows.Count(r => r.Source.Status == FreshnessStatus.Stale);
+        SetStatus($"{locals.Count} subscribed · {stale} stale · {rows.Count(r => r.Source.Status == FreshnessStatus.Current)} current.");
+    }
+
+    private async void OnRefreshRowClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is AuditedItemRow row)
+        {
+            await RefreshItemsAsync(new[] { row.LocalItem });
+        }
+    }
+
+    private async void OnRefreshSelectedClicked(object sender, RoutedEventArgs e)
+    {
+        var rows = MyModsGrid.SelectedItems.OfType<AuditedItemRow>().ToList();
+        if (rows.Count == 0)
+        {
+            MessageBox.Show(this, "Select one or more rows first.", "Workshop Sentinel");
+            return;
+        }
+        await RefreshItemsAsync(rows.Select(r => r.LocalItem).ToList());
+    }
+
+    private async void OnRefreshAllStaleClicked(object sender, RoutedEventArgs e)
+    {
+        var stale = _myMods.Where(r => r.Source.Status == FreshnessStatus.Stale)
+            .Select(r => r.LocalItem).ToList();
+        if (stale.Count == 0)
+        {
+            MessageBox.Show(this, "No stale items in this game.", "Workshop Sentinel");
+            return;
+        }
+        await RefreshItemsAsync(stale);
+    }
+
+    private async void OnRefreshAllUnknownClicked(object sender, RoutedEventArgs e)
+    {
+        // Friends-only / private items return result=9 from the public API, surface as Unknown.
+        // The author of those mods often wants to nuke + re-pull them because the API-visible
+        // staleness signal isn't available.
+        var unknown = _myMods.Where(r => r.Source.Status == FreshnessStatus.Unknown)
+            .Select(r => r.LocalItem).ToList();
+        if (unknown.Count == 0)
+        {
+            MessageBox.Show(this, "No friends-only (Unknown) items in this game.", "Workshop Sentinel");
+            return;
+        }
+        await RefreshItemsAsync(unknown);
+    }
+
+    private async void OnRefreshAllItemsClicked(object sender, RoutedEventArgs e)
+    {
+        var all = _myMods.Where(r => r.Source.Status != FreshnessStatus.Removed)
+            .Select(r => r.LocalItem).ToList();
+        if (all.Count == 0)
+        {
+            MessageBox.Show(this, "Nothing to refresh.", "Workshop Sentinel");
+            return;
+        }
+        await RefreshItemsAsync(all);
+    }
+
+    private async Task RefreshItemsAsync(IReadOnlyList<WorkshopItemLocal> items)
+    {
+        if (items.Count == 0) return;
+
+        if (_steamGuard.IsSteamRunning())
+        {
+            var resp = MessageBox.Show(this,
+                $"Steam appears to be running. The refresh will delete files inside\n" +
+                $"steamapps\\workshop\\content — Steam may hold handles on them and the\n" +
+                $"delete can fail.\n\nClose Steam, then click OK. Cancel to abort.",
+                "Steam is running", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            if (resp != MessageBoxResult.OK) return;
+        }
+
+        var totalBytes = items.Sum(i => i.LocalSizeBytes);
+        var confirm = MessageBox.Show(this,
+            $"About to delete the local copy of {items.Count} item(s) ({FormatSize(totalBytes)}) and ask Steam to re-download.\n\nProceed?",
+            "Confirm refresh", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+        if (confirm != MessageBoxResult.OK) return;
+
+        SetStatus($"Refreshing {items.Count} item(s)…");
+        var progress = new Progress<RefreshStep>(s => SetStatus($"[{s.Stage}] {s.PublishedFileId}  {s.Message}"));
+        var outcomes = await _refresher.RefreshAsync(items, progress);
+
+        var ok   = outcomes.Count(o => o.Success);
+        var fail = outcomes.Count - ok;
+        MessageBox.Show(this,
+            $"Refresh complete.\n\nSucceeded: {ok}\nFailed: {fail}\n\n" +
+            (fail > 0
+                ? "Failed items left a tip on the status bar. Restart Steam to confirm re-download starts."
+                : "Restart Steam (or wait for the steam:// nudges to land) to confirm re-download starts."),
+            "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Information);
+
+        // Re-audit so the grid reflects the new state.
+        await AuditSelectedGameAsync(force: true);
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes < 1024)        return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
+        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
+    }
+
+    // ===================================================================
+    //  Friends Compare tab
+    // ===================================================================
+
+    private async void OnAddFriendClicked(object sender, RoutedEventArgs e)
+        => await AddFriendFromInputAsync();
+
+    private async void OnFriendInputKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter) { e.Handled = true; await AddFriendFromInputAsync(); }
+    }
+
+    private async Task AddFriendFromInputAsync()
+    {
+        var raw = FriendInput.Text?.Trim();
+        if (string.IsNullOrWhiteSpace(raw)) return;
+        if (FriendGameCombo.SelectedValue is not uint appId)
+        {
+            MessageBox.Show(this, "Pick a game first.", "Workshop Sentinel");
+            return;
+        }
+
+        SetStatus($"Resolving '{raw}'…");
+        var friend = await _friendClient.ResolveAsync(raw);
+        if (friend is null)
+        {
+            MessageBox.Show(this, $"Couldn't resolve '{raw}' to a Steam profile.\nCheck the spelling and that the profile exists.", "Workshop Sentinel");
+            SetStatus("Ready.");
+            return;
+        }
+
+        if (_friends.Any(f => f.SteamId64 == friend.SteamId64))
+        {
+            MessageBox.Show(this, $"'{friend.DisplayName ?? friend.SteamId64}' is already added.", "Workshop Sentinel");
+            return;
+        }
+
+        SetStatus($"Fetching {friend.DisplayName ?? friend.SteamId64}'s subs for {_names.Resolve(appId)}…");
+        var sub = await _friendClient.FetchSubscriptionsAsync(friend, appId);
+        if (sub.Outcome == FriendScrapeOutcome.ProfilePrivate)
+        {
+            MessageBox.Show(this,
+                $"{friend.DisplayName ?? friend.SteamId64}'s profile (or Workshop section) is private.\n\n" +
+                "They need to set Profile + Game Details + Inventory to Public for this to work.",
+                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Warning);
+            SetStatus("Ready.");
+            return;
+        }
+        if (sub.Outcome == FriendScrapeOutcome.NetworkError)
+        {
+            MessageBox.Show(this, $"Network error while fetching subs: {sub.ErrorDetail}", "Workshop Sentinel",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+            SetStatus("Ready.");
+            return;
+        }
+
+        _friends.Add(friend);
+        _friendSubs[friend.SteamId64] = new HashSet<ulong>(sub.PublishedFileIds);
+        FriendInput.Clear();
+
+        await RebuildFriendsCompareAsync();
+    }
+
+    private async void OnClearFriendsClicked(object sender, RoutedEventArgs e)
+    {
+        _friends.Clear();
+        _friendSubs.Clear();
+        await RebuildFriendsCompareAsync();
+    }
+
+    private async void OnReloadMySubsClicked(object sender, RoutedEventArgs e)
+        => await RebuildFriendsCompareAsync();
+
+    private async Task RebuildFriendsCompareAsync()
+    {
+        if (FriendGameCombo.SelectedValue is not uint appId)
+        {
+            FriendsGrid.ItemsSource = null;
+            return;
+        }
+
+        SetStatus($"Building compare view for {_names.Resolve(appId)}…");
+
+        // My local subs for this game.
+        var myLocals = await Task.Run(() =>
+            _enumerator.EnumerateForApp(_libraryRoots, appId).ToList());
+        var mineSet  = myLocals.Select(l => l.PublishedFileId).ToHashSet();
+
+        // Union of every publishedfileid across me + every added friend.
+        var allIds = new HashSet<ulong>(mineSet);
+        foreach (var sub in _friendSubs.Values) allIds.UnionWith(sub);
+        if (allIds.Count == 0)
+        {
+            FriendsGrid.ItemsSource = null;
+            FriendsGrid.Columns.Clear();
+            SetStatus("No items in the union — add a friend or pick a different game.");
+            return;
+        }
+
+        // Fetch titles for every ID in the union (so the grid shows names, not bare numbers).
+        var remotes = await _api.GetPublishedFileDetailsAsync(allIds);
+
+        // Rebuild columns. First = mod title, then "You", then one per friend.
+        FriendsGrid.Columns.Clear();
+        FriendsGrid.ItemsSource = null;
+        FriendsGrid.Columns.Add(new DataGridTextColumn
+        {
+            Header  = "Mod",
+            Binding = new Binding("[Title]"),
+            Width   = new DataGridLength(3, DataGridLengthUnitType.Star),
+        });
+        FriendsGrid.Columns.Add(new DataGridTextColumn
+        {
+            Header  = "ID",
+            Binding = new Binding("[Id]"),
+            Width   = new DataGridLength(120),
+        });
+        FriendsGrid.Columns.Add(MakeMarkColumn("You", "[You]"));
+        foreach (var f in _friends)
+        {
+            FriendsGrid.Columns.Add(MakeMarkColumn(
+                f.DisplayName ?? f.VanitySlug ?? f.SteamId64,
+                $"[f{f.SteamId64}]"));
+        }
+
+        // Build rows. Use a Dictionary<string,string> per row so column bindings can be string-keyed.
+        var rows = allIds
+            .Select(id =>
+            {
+                remotes.TryGetValue(id, out var r);
+                var d = new Dictionary<string, string>
+                {
+                    ["Title"] = r?.Title ?? $"#{id}",
+                    ["Id"]    = id.ToString(),
+                    ["You"]   = mineSet.Contains(id) ? "✓" : "·",
+                };
+                foreach (var f in _friends)
+                {
+                    d[$"f{f.SteamId64}"] = _friendSubs[f.SteamId64].Contains(id) ? "✓" : "·";
+                }
+                return d;
+            })
+            .OrderBy(d => d["Title"], StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        FriendsGrid.ItemsSource = rows;
+        SetStatus($"{rows.Count} mod(s) across you + {_friends.Count} friend(s).");
+    }
+
+    // --- Steam friends picker (left panel of Compare tab) ---
+
+    private void ReloadFriendRoster()
+    {
+        if (_friendsResolver is null)
+        {
+            SetStatus("Steam not found — friend roster unavailable.");
+            return;
+        }
+
+        var favSet = new HashSet<string>(_settings.FavoriteFriendSteamIds, StringComparer.Ordinal);
+        var roster = _friendsResolver.Resolve();
+        if (roster.Count == 0)
+        {
+            SetStatus("No friends found in Steam's localconfig.vdf. (Has the Steam client been opened on this PC?)");
+            return;
+        }
+
+        foreach (var f in roster) f.IsFavorite = favSet.Contains(f.SteamId64);
+
+        _friendRoster.Clear();
+        foreach (var f in roster) _friendRoster.Add(new FriendRow(f));
+        ResortFriendRoster();
+        SetStatus($"Loaded {_friendRoster.Count} Steam friend(s) from localconfig.vdf.");
+    }
+
+    private void ResortFriendRoster()
+    {
+        var sorted = _friendRoster.OrderBy(r => r.SortKey).ToList();
+        _friendRoster.Clear();
+        foreach (var r in sorted) _friendRoster.Add(r);
+    }
+
+    private void OnReloadFriendListClicked(object sender, RoutedEventArgs e)
+        => ReloadFriendRoster();
+
+    private async void OnRefreshOnlineStatusClicked(object sender, RoutedEventArgs e)
+    {
+        if (_friendRoster.Count == 0) { ReloadFriendRoster(); if (_friendRoster.Count == 0) return; }
+
+        SetStatus($"Fetching online status for {_friendRoster.Count} friend(s)…");
+        // Cap concurrency — Steam profile pages are cheap but ~100 simultaneous requests is rude.
+        var sem = new SemaphoreSlim(8);
+        var snapshot = _friendRoster.ToList();
+        var tasks = snapshot.Select(async row =>
+        {
+            await sem.WaitAsync();
+            try
+            {
+                var state = await _friendClient.FetchOnlineStateAsync(row.SteamId64);
+                await Dispatcher.InvokeAsync(() => row.Online = state);
+            }
+            finally { sem.Release(); }
+        });
+        await Task.WhenAll(tasks);
+
+        ResortFriendRoster();
+        var online = _friendRoster.Count(r => r.Online == FriendOnlineState.Online || r.Online == FriendOnlineState.InGame);
+        SetStatus($"Online status refreshed. {online} friend(s) currently online.");
+    }
+
+    private void OnFriendFavoriteToggled(object sender, RoutedEventArgs e)
+    {
+        // ToggleButton has already flipped IsChecked (and the binding pushed it into IsFavorite).
+        // Persist the new favorite set + re-sort the list so the toggled row jumps into place.
+        _settings.FavoriteFriendSteamIds = _friendRoster
+            .Where(r => r.IsFavorite)
+            .Select(r => r.SteamId64)
+            .ToList();
+        try { _settingsStore.Save(_settings); }
+        catch (Exception ex) { SetStatus($"Couldn't save favorites: {ex.Message}"); return; }
+
+        ResortFriendRoster();
+    }
+
+    private async void OnAddFriendFromListClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.DataContext is not FriendRow row) return;
+        if (FriendGameCombo.SelectedValue is not uint appId)
+        {
+            MessageBox.Show(this, "Pick a game first.", "Workshop Sentinel");
+            return;
+        }
+
+        if (_friends.Any(f => f.SteamId64 == row.SteamId64))
+        {
+            MessageBox.Show(this, $"'{row.PersonaName}' is already added.", "Workshop Sentinel");
+            return;
+        }
+
+        var friend = new FriendIdentity(row.SteamId64, null, row.PersonaName);
+        SetStatus($"Fetching {row.PersonaName}'s subs for {_names.Resolve(appId)}…");
+        var sub = await _friendClient.FetchSubscriptionsAsync(friend, appId);
+
+        if (sub.Outcome == FriendScrapeOutcome.ProfilePrivate)
+        {
+            MessageBox.Show(this,
+                $"{row.PersonaName}'s profile (or Workshop section) is private.\n\n" +
+                "They'd need to set Profile + Game Details + Inventory to Public for this to work.",
+                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Warning);
+            SetStatus("Ready.");
+            return;
+        }
+        if (sub.Outcome == FriendScrapeOutcome.NetworkError)
+        {
+            MessageBox.Show(this, $"Network error: {sub.ErrorDetail}", "Workshop Sentinel",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+            SetStatus("Ready.");
+            return;
+        }
+
+        _friends.Add(friend);
+        _friendSubs[friend.SteamId64] = new HashSet<ulong>(sub.PublishedFileIds);
+        await RebuildFriendsCompareAsync();
+    }
+
+    private static DataGridTextColumn MakeMarkColumn(string header, string indexerPath)
+    {
+        return new DataGridTextColumn
+        {
+            Header              = header,
+            Binding             = new Binding(indexerPath),
+            Width               = new DataGridLength(110),
+            ElementStyle        = MakeCenteredStyle(),
+        };
+    }
+
+    private static Style MakeCenteredStyle()
+    {
+        var s = new Style(typeof(TextBlock));
+        s.Setters.Add(new Setter(TextBlock.HorizontalAlignmentProperty, HorizontalAlignment.Center));
+        s.Setters.Add(new Setter(TextBlock.FontSizeProperty, 15.0));
+        return s;
+    }
+
+    // ===================================================================
+    //  shared
+    // ===================================================================
+    private void SetStatus(string msg)
+    {
+        if (Dispatcher.CheckAccess()) StatusLabel.Text = msg;
+        else Dispatcher.Invoke(() => StatusLabel.Text = msg);
     }
 }

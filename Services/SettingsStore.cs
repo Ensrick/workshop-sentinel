@@ -21,6 +21,14 @@ public sealed class Settings
     /// <summary>Last-used audit filter ("all" / "stale" / "unknown" / "removed").</summary>
     [JsonPropertyName("ui_filter")]
     public string? UiFilter { get; set; }
+
+    /// <summary>
+    /// SteamID64s the user has starred in the Compare to Friends tab. Persisted so the
+    /// star survives restarts. (Steam's own per-friend favorite flag lives in the Friends
+    /// UI's Chromium IndexedDB and isn't reachable from plain-text VDFs.)
+    /// </summary>
+    [JsonPropertyName("favorite_friend_steamids")]
+    public System.Collections.Generic.List<string> FavoriteFriendSteamIds { get; set; } = new();
 }
 
 public sealed class SettingsStore

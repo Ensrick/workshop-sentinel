@@ -179,4 +179,67 @@ public sealed class AcfNode
     // ---------- Convenience: read a file from disk ----------
 
     public static AcfNode ParseFile(string path) => Parse(File.ReadAllText(path));
+
+    // ---------- Mutation ----------
+
+    /// <summary>
+    /// Remove a child key from this object node. No-op on scalars or if the key is absent.
+    /// Used by RefreshExecutor to strip a Workshop item entry from the ACF tree.
+    /// </summary>
+    public bool Remove(string key)
+    {
+        if (_children is null) return false;
+        return _children.Remove(key);
+    }
+
+    // ---------- Serializer ----------
+    //
+    // Steam writes ACF with a wrapper key ("AppWorkshop" / "AppState") around the root object.
+    // Parse() strips that wrapper, so Write() needs the caller to supply it back. Format mirrors
+    // what Steam emits: 2-space indent, "key"<tab>"value" for scalars, key on its own line followed
+    // by "{" / "}" on their own lines for objects. Round-trip stability is exercised in tests.
+
+    /// <summary>Serialize this node as the body of a top-level wrapper key, matching Steam's own format.</summary>
+    public void Write(string wrapperKey, TextWriter writer)
+    {
+        if (!IsObject) throw new InvalidOperationException("Write requires an object node.");
+        writer.Write('"'); writer.Write(Escape(wrapperKey)); writer.WriteLine('"');
+        writer.WriteLine("{");
+        WriteChildren(this, writer, depth: 1);
+        writer.WriteLine("}");
+    }
+
+    private static void WriteChildren(AcfNode node, TextWriter writer, int depth)
+    {
+        var indent = new string('\t', depth);
+        foreach (var (key, child) in node.Children)
+        {
+            if (child.IsObject)
+            {
+                writer.Write(indent); writer.Write('"'); writer.Write(Escape(key)); writer.WriteLine('"');
+                writer.Write(indent); writer.WriteLine("{");
+                WriteChildren(child, writer, depth + 1);
+                writer.Write(indent); writer.WriteLine("}");
+            }
+            else
+            {
+                writer.Write(indent);
+                writer.Write('"'); writer.Write(Escape(key)); writer.Write("\"\t\t");
+                writer.Write('"'); writer.Write(Escape(child.AsString())); writer.WriteLine('"');
+            }
+        }
+    }
+
+    private static string Escape(string s)
+    {
+        // Only `"` and `\` need escaping in Valve's quoted strings; other characters pass through.
+        if (s.IndexOfAny(new[] { '"', '\\' }) < 0) return s;
+        var sb = new StringBuilder(s.Length + 8);
+        foreach (var ch in s)
+        {
+            if (ch == '"' || ch == '\\') sb.Append('\\');
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
 }
