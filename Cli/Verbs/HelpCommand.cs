@@ -18,6 +18,7 @@ VERBS
   audit   [--game <appid>] [--stale-only] [--json]        Audit local vs live; print per-item status.
   refresh <item-id> [<item-id>...] [--yes]                Force re-download (deletes local cache).
   doctor                                                  Run diagnostics (Steam path, API reachable, etc.).
+  selfupdate [--yes] [--json]                             Check (and optionally install) a newer Workshop Sentinel.
   help                                                    Show this text.
 
 GLOBAL FLAGS
@@ -30,6 +31,7 @@ EXIT CODES
   1  runtime error
   2  bad usage
   3  preflight failed (Steam path missing, API unreachable, etc.)
+  10 selfupdate: update available (only when --yes was NOT passed)
 ");
         return 0;
     }

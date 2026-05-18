@@ -34,6 +34,7 @@ public static class CliRunner
             "help" or "--help" or "-h" => HelpCommand.Run(rest),
             "list"    => ListCommand.Run(rest, ResolveSettingsStore(flags)),
             "audit"   => AuditCommand.RunAsync(rest, ResolveSettingsStore(flags)).GetAwaiter().GetResult(),
+            "selfupdate" => SelfUpdateCommand.RunAsync(rest).GetAwaiter().GetResult(),
             // Stubs for not-yet-built verbs.
             "refresh" => StubVerb("refresh", "Implemented in M4 (RefreshExecutor)."),
             "doctor"  => StubVerb("doctor", "Implemented in M5 (DoctorCommand)."),
