@@ -5,6 +5,23 @@ All notable changes to Workshop Sentinel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-05-18
+
+In-app self-update. When a newer build is available on GitHub, Workshop Sentinel says so — once via a colored stripe across the top of the window with "Update now" / "Later", and again as a subtle footer cue that stays visible after the banner is dismissed. One click downloads the new exe, verifies its SHA256 against the digest GitHub publishes for the release asset, swaps it in alongside the running exe, and restarts. A new `selfupdate` CLI verb makes the same thing work over SSH.
+
+### Added
+
+- **Top-of-window update banner** (`MainWindow.xaml` + `MainWindow.xaml.cs`) — colored stripe with `Workshop Sentinel v{X} is available.` plus "Update now" / "Later" buttons. Session-dismissible (`_updateBannerDismissed`). The footer cue stays as a tertiary indicator for users who dismiss the banner but want a persistent reminder. Banner and footer share `_pendingUpdate` and a single `OnUpdateClicked` handler — install logic isn't duplicated.
+- **`selfupdate` CLI verb** (`Cli/Verbs/SelfUpdateCommand.cs`) — `workshop-sentinel selfupdate [--yes] [--json]`. Exit codes: `0` latest, `0` updated, `10` update available without `--yes` (so a wrapper script can decide), `1` failed. After a successful headless install the process exits without relaunching — designed for the PC-B-over-SSH install path. Wired into `CliRunner` + `help`.
+- **`Services/UpdateChecker.cs`** — polls `https://api.github.com/repos/Ensrick/workshop-sentinel/releases/latest`, picks the `WorkshopSentinel.exe` asset, parses `tag_name` / `browser_download_url` / `size` / `digest`. Result is disk-cached at `%APPDATA%\WorkshopSentinel\update-cache.json` for 6h to avoid hammering the API. SemVer compare with a special case: same numeric prefix where the running version has a `-prerelease` suffix and the latest doesn't counts as "update available" (so 0.1.0-alpha sees 0.1.0 as an upgrade).
+- **`Services/UpdateInstaller.cs`** — downloads the new exe to `WorkshopSentinel.exe.new` next to the running binary, hashes it via streaming `SHA256`, verifies against the expected digest, then uses the Windows rename-running-exe trick (`File.Move` running.exe → `.old`, `.new` → running.exe) to slot the new build in. Reports byte-progress to a caller-supplied `IProgress<double>`. Cleans up partial `.new` files on failure.
+- **`Program.CleanupStaleArtifacts`** — every launch best-effort-deletes leftover `WorkshopSentinel.exe.old` (from a clean prior update) and `.new` (from one that crashed mid-flight) so the install directory doesn't accumulate cruft.
+- **`Program.Version`** bumped from `0.1.0-alpha` to `0.2.0`.
+
+### Tooling
+
+- **`release.ps1`** — full publish-to-GitHub automation. Validates the version, bumps `Program.Version`, prepends a CHANGELOG stub when needed, runs `publish.ps1` (tests + build), commits, tags `vX.Y.Z`, pushes, creates the GitHub release with the exe attached, and sanity-checks that the uploaded asset got a `digest: "sha256:..."` field from GitHub — without that, `UpdateChecker` can't verify the download and self-update silently breaks. Supports `-DryRun` for local rehearsal.
+
 ## [0.1.0-alpha] — 2026-05-17
 
 First user-installable alpha. End-to-end audit + refresh + friend-compare flow works for public + the manual paths around friends-only items.
