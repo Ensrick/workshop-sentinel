@@ -3,17 +3,26 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using WorkshopSentinel.Cli;
+using WorkshopSentinel.Services;
 
 namespace WorkshopSentinel;
 
 public static class Program
 {
-    public const string Version = "0.1.0-alpha";
+    public const string Version = "0.0.1";
 
     [STAThread]
     public static int Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
+
+        // Best-effort cleanup of leftover self-update artifacts (a .old from a clean update,
+        // or a .new from one that crashed mid-flight) before anything else touches the disk.
+        var exePath = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(exePath))
+        {
+            UpdateInstaller.CleanupStaleArtifacts(exePath);
+        }
 
         if (IsHeadlessInvocation(args))
         {

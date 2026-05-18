@@ -217,7 +217,33 @@
         <Border DockPanel.Dock="Bottom" Background="#161616" Padding="12,6">
             <DockPanel>
                 <TextBlock x:Name="StatusLabel" Text="Ready." Foreground="#888" />
-                <TextBlock x:Name="VersionLabel" DockPanel.Dock="Right" Foreground="#555" />
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <TextBlock x:Name="VersionLabel" Foreground="#555" VerticalAlignment="Center" />
+                    <TextBlock x:Name="UpdateStatusLabel" Foreground="#888" VerticalAlignment="Center" Margin="8,0,0,0" />
+                    <Button x:Name="UpdateButton" Content="Update" Style="{StaticResource ActionButton}"
+                            Margin="8,0,0,0" Visibility="Collapsed" Click="OnUpdateClicked" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- Update-available banner. Additive to the footer cue: more prominent placement at the
+             top of the window, dismissible per-session via "Later" (the footer label/button
+             remain visible as a tertiary cue and reappear next launch if not acted on). -->
+        <Border x:Name="UpdateBanner" DockPanel.Dock="Top" Visibility="Collapsed"
+                Background="#2D5FAF" BorderBrush="#7AB0FF" BorderThickness="0,0,0,2"
+                Padding="16,10">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="UpdateBannerInstallButton" Content="Update now"
+                            Style="{StaticResource ActionButton}" Background="#1A1A1A"
+                            Margin="0,0,8,0" Click="OnUpdateClicked" />
+                    <Button x:Name="UpdateBannerLaterButton" Content="Later"
+                            Style="{StaticResource ActionButton}" Background="#3A4658"
+                            Click="OnUpdateBannerLaterClicked" />
+                </StackPanel>
+                <TextBlock x:Name="UpdateBannerText" VerticalAlignment="Center"
+                           Foreground="#FFFFFF" FontSize="14" FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis" />
             </DockPanel>
         </Border>
 

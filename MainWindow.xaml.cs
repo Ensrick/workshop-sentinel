@@ -32,6 +32,10 @@ public partial class MainWindow : Window
     private readonly AppNameResolver               _names;
     private readonly RefreshExecutor               _refresher;
     private readonly SteamFriendsResolver?         _friendsResolver;
+    private readonly UpdateChecker                 _updateChecker;
+    private readonly UpdateInstaller               _updateInstaller;
+    private UpdateCheckResult?                     _pendingUpdate;
+    private bool                                   _updateBannerDismissed;
 
     // ---- in-memory state ----
     private readonly ObservableCollection<GameRow>         _games     = new();
@@ -72,6 +76,8 @@ public partial class MainWindow : Window
         _friendClient = new FriendSubscriptionsClient(_http);
         _refresher    = new RefreshExecutor(_libraryRoots);
         _friendsResolver = string.IsNullOrEmpty(_steamRoot) ? null : new SteamFriendsResolver(_steamRoot);
+        _updateChecker   = new UpdateChecker(_http);
+        _updateInstaller = new UpdateInstaller(_http);
 
         GamesGrid.ItemsSource    = _games;
         MyModsGrid.ItemsSource   = _myMods;
@@ -80,6 +86,8 @@ public partial class MainWindow : Window
         // Initial population
         Loaded += async (_, _) =>
         {
+            // Update check is fire-and-forget — failures land in the status footer, never a dialog.
+            _ = CheckForUpdatesAsync();
             await ReloadGamesAsync();
             ReloadFriendRoster();
         };
@@ -616,6 +624,114 @@ public partial class MainWindow : Window
         s.Setters.Add(new Setter(TextBlock.HorizontalAlignmentProperty, HorizontalAlignment.Center));
         s.Setters.Add(new Setter(TextBlock.FontSizeProperty, 15.0));
         return s;
+    }
+
+    // ===================================================================
+    //  Self-update
+    // ===================================================================
+    private async Task CheckForUpdatesAsync()
+    {
+        try
+        {
+            var result = await _updateChecker.CheckAsync(Program.Version);
+            await Dispatcher.InvokeAsync(() => ApplyUpdateCheck(result));
+        }
+        catch
+        {
+            // The checker swallows expected exceptions; anything reaching here is unexpected.
+            // Don't take down the GUI — the existing version label remains accurate.
+        }
+    }
+
+    private void ApplyUpdateCheck(UpdateCheckResult result)
+    {
+        switch (result.Status)
+        {
+            case UpdateStatus.Latest:
+                _pendingUpdate = null;
+                UpdateStatusLabel.Text  = "(latest)";
+                UpdateStatusLabel.Foreground = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55));
+                UpdateButton.Visibility = Visibility.Collapsed;
+                UpdateBanner.Visibility = Visibility.Collapsed;
+                break;
+            case UpdateStatus.UpdateAvailable when result.LatestVersion is not null
+                                              && !string.IsNullOrEmpty(result.DownloadUrl):
+                _pendingUpdate = result;
+                UpdateStatusLabel.Text  = $"— v{result.LatestVersion} available";
+                UpdateStatusLabel.Foreground = new SolidColorBrush(Color.FromRgb(0x5A, 0x9B, 0xFF));
+                UpdateButton.Visibility = Visibility.Visible;
+                UpdateBannerText.Text   = $"Workshop Sentinel v{result.LatestVersion} is available.";
+                UpdateBanner.Visibility = _updateBannerDismissed ? Visibility.Collapsed : Visibility.Visible;
+                break;
+            case UpdateStatus.CheckFailed:
+            default:
+                _pendingUpdate = null;
+                UpdateStatusLabel.Text  = "(update check failed)";
+                UpdateStatusLabel.Foreground = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
+                UpdateButton.Visibility = Visibility.Collapsed;
+                UpdateBanner.Visibility = Visibility.Collapsed;
+                break;
+        }
+    }
+
+    private void OnUpdateBannerLaterClicked(object sender, RoutedEventArgs e)
+    {
+        _updateBannerDismissed = true;
+        UpdateBanner.Visibility = Visibility.Collapsed;
+    }
+
+    private async void OnUpdateClicked(object sender, RoutedEventArgs e)
+    {
+        if (_pendingUpdate is null || _pendingUpdate.DownloadUrl is null) return;
+        var target = _pendingUpdate;
+
+        var confirm = MessageBox.Show(this,
+            $"Update to v{target.LatestVersion}? The app will restart.",
+            "Workshop Sentinel", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+        if (confirm != MessageBoxResult.OK) return;
+
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath))
+        {
+            MessageBox.Show(this, "Couldn't resolve the running executable path. Update aborted.",
+                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        UpdateButton.IsEnabled = false;
+        SetStatus($"Downloading v{target.LatestVersion}…");
+        var progress = new Progress<double>(p =>
+            SetStatus($"Downloading v{target.LatestVersion}… {(int)(p * 100)}%"));
+
+        var result = await _updateInstaller.DownloadAndSwapAsync(
+            exePath, target.DownloadUrl, target.AssetSha256, progress);
+
+        if (!result.Success)
+        {
+            UpdateButton.IsEnabled = true;
+            SetStatus("Update failed.");
+            MessageBox.Show(this,
+                $"Update failed: {result.Error}\n\nThe running app is unchanged. You can try again, or download v{target.LatestVersion} manually from the Releases page.",
+                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        SetStatus($"Update installed — restarting…");
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName        = exePath,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this,
+                $"Update installed but relaunch failed: {ex.Message}\n\nClose this window and start WorkshopSentinel.exe manually.",
+                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        Application.Current.Shutdown();
     }
 
     // ===================================================================
