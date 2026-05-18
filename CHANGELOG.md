@@ -5,6 +5,16 @@ All notable changes to Workshop Sentinel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-05-18
+
+Smoke-test release verifying the v0.2.0 self-update pipeline end-to-end. No code changes vs. v0.2.0 beyond the version bump — the value of this release is purely existing as a "newer version" for v0.2.0 installs to detect, download, verify, and install. Future patches go on top.
+
+### Verified
+
+- v0.2.0 installs detect v0.2.1 via the GitHub Releases poll (footer cue + top banner in the GUI; `selfupdate` exit-10 over CLI).
+- `UpdateInstaller.DownloadAndSwapAsync` downloads the v0.2.1 asset, SHA256-verifies against the GitHub-published digest, renames the running exe to `.old`, and slots the new binary into place.
+- `Program.CleanupStaleArtifacts` removes the `.old` sibling on the next launch.
+
 ## [0.2.0] — 2026-05-18
 
 In-app self-update. When a newer build is available on GitHub, Workshop Sentinel says so — once via a colored stripe across the top of the window with "Update now" / "Later", and again as a subtle footer cue that stays visible after the banner is dismissed. One click downloads the new exe, verifies its SHA256 against the digest GitHub publishes for the release asset, swaps it in alongside the running exe, and restarts. A new `selfupdate` CLI verb makes the same thing work over SSH.
