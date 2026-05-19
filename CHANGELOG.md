@@ -5,6 +5,35 @@ All notable changes to Workshop Sentinel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-05-19
+
+### Fixed — self-update cache poisoned after install (the "v0.3.0 sees itself as latest" bug)
+
+`UpdateChecker.CheckAsync` now treats a cache whose `CurrentVersion` field doesn't match the running binary's version as stale, and forces a fresh GitHub poll. Previously, when an in-place self-update landed inside the 6h cache TTL, the next launch's update check would silently use the pre-update cache and conclude "you're on the latest" — even when a NEWER release had shipped since.
+
+**Burning case:** at 16:20 UTC PC-B's v0.2.1 install polled GitHub, found v0.3.0 as latest, cached `{CurrentVersion: 0.2.1, LatestVersion: 0.3.0}`, and installed v0.3.0. At 16:42 UTC v0.3.1 was published. When PC-B's v0.3.0 launched after that, it loaded the still-fresh cache, called `RecomputeStatus("0.3.0", "0.3.0")` → `Latest`, and showed no update banner — even though v0.3.1 was sitting on GitHub. The banner stayed hidden for the remaining ~5.5 h of the TTL.
+
+The fix is a single short-circuit clause in `CheckAsync`:
+
+```csharp
+if (cached is not null
+    && DateTime.UtcNow - cached.CheckedAtUtc < CacheTtl
+    && string.Equals(cached.CurrentVersion, currentVersion, StringComparison.Ordinal))
+{
+    return RecomputeStatus(cached, currentVersion);
+}
+```
+
+A `CurrentVersion` mismatch means the cache was written by a previous install of us — so the install itself is evidence the cache is stale, no matter how recent the timestamp. Re-poll.
+
+### Bug history
+
+This bug has been in `UpdateChecker` since it shipped in v0.2.0. It only surfaces when two releases land within the 6h cache TTL of each other — rare in steady-state, hit immediately when iterating on the self-update flow itself. v0.2.x users coming up to v0.3.x via a single hop never encountered it.
+
+### Test coverage
+
+10 `UpdateChecker` tests (file is new): 5 `CompareStatus` semver cases, `ParseLatestRelease` field extraction, fresh-cache happy path, **the exact bug repro** (`CheckAsync_repolls_when_running_version_differs_from_cached_current`), TTL-stale repoll, and `forceRefresh` bypass.
+
 ## [0.3.1] — 2026-05-19
 
 ### Changed — single-tab friend compare, interactive You-column toggle

@@ -82,7 +82,17 @@ public sealed class UpdateChecker
         if (!forceRefresh)
         {
             var cached = TryLoadCache();
-            if (cached is not null && DateTime.UtcNow - cached.CheckedAtUtc < CacheTtl)
+            if (cached is not null
+                && DateTime.UtcNow - cached.CheckedAtUtc < CacheTtl
+                // Cache was written by an older install. Anything after a self-update lands
+                // here: the previous build cached "{current: X, latest: Y}" then installed Y,
+                // and the new build's launch must not just re-use that cache, because a
+                // NEWER release (Z > Y) may have shipped inside the 6h TTL window. Force a
+                // fresh GitHub poll whenever the running binary's version doesn't match what
+                // wrote the cache. (Burned in v0.3.0→v0.3.1: the v0.3.0 install kept seeing
+                // itself as "latest" because the cache from the 0.2.1 → 0.3.0 check still
+                // claimed 0.3.0 was the newest version.)
+                && string.Equals(cached.CurrentVersion, currentVersion, StringComparison.Ordinal))
             {
                 // Cached result was computed against whatever version was running back then —
                 // re-evaluate against the version we're running *now* so a just-installed
