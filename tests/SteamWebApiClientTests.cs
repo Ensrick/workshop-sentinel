@@ -12,6 +12,91 @@ namespace WorkshopSentinel.Tests;
 
 public sealed class SteamWebApiClientTests
 {
+    // --- IsMod filter ----------------------------------------------------------
+    // These were burning us when a friend's Workshop sub list leaked controller
+    // configs (file_type 13) and Steam localization placeholders ("#Library_..."
+    // titles) into the matrix. The friend-compare view rendered rows that were
+    // not user-publishable mods at all.
+
+    [Fact]
+    public void IsMod_accepts_regular_public_mod()
+    {
+        var item = new WorkshopItemRemote(
+            123, "Tweaker: Chaos Wastes", 1700000000, 1024, 0, false, 1,
+            FileType: 0, ConsumerAppId: 552500);
+        Assert.True(SteamWebApiClient.IsMod(item, 552500));
+    }
+
+    [Fact]
+    public void IsMod_rejects_controller_binding_filetype_13()
+    {
+        var item = new WorkshopItemRemote(
+            123, "#Library_ControllerSaveDefaultTitle", 1700000000, 0, 0, false, 1,
+            FileType: 13, ConsumerAppId: 552500);
+        Assert.False(SteamWebApiClient.IsMod(item, 552500));
+    }
+
+    [Fact]
+    public void IsMod_rejects_localization_key_title()
+    {
+        var item = new WorkshopItemRemote(
+            123, "#Library_ControllerSaveDefaultTitle", 1700000000, 0, 0, false, 1,
+            FileType: 0, ConsumerAppId: 552500);
+        Assert.False(SteamWebApiClient.IsMod(item, 552500));
+    }
+
+    [Fact]
+    public void IsMod_rejects_cross_game_consumer_app_id()
+    {
+        // Item is for a different game (consumer_app_id mismatch) — Steam's
+        // appid= URL filter let it through but we shouldn't display it.
+        var item = new WorkshopItemRemote(
+            123, "Skyrim mod", 1700000000, 1024, 0, false, 1,
+            FileType: 0, ConsumerAppId: 489830);
+        Assert.False(SteamWebApiClient.IsMod(item, 552500));
+    }
+
+    [Fact]
+    public void IsMod_accepts_friend_visible_item_without_consumer_app_id()
+    {
+        // When the API returns no consumer_app_id (older items, partial response)
+        // we accept by default so we don't false-negative real mods.
+        var item = new WorkshopItemRemote(
+            123, "Some mod", 1700000000, 1024, 0, false, 1,
+            FileType: null, ConsumerAppId: null);
+        Assert.True(SteamWebApiClient.IsMod(item, 552500));
+    }
+
+    [Fact]
+    public void IsMod_rejects_api_result_not_ok()
+    {
+        // result=9 = friends-only/private and the API gave us no metadata. We
+        // can't tell if it's a mod; safest to drop from the visible matrix.
+        var item = new WorkshopItemRemote(123, null, null, null, null, null, 9);
+        Assert.False(SteamWebApiClient.IsMod(item, 552500));
+    }
+
+    [Fact]
+    public void ParseResponse_captures_file_type_and_consumer_app_id()
+    {
+        var json = """
+            { "response": {
+                "result": 1, "resultcount": 1,
+                "publishedfiledetails": [{
+                    "publishedfileid": "999",
+                    "result": 1,
+                    "title": "x",
+                    "file_type": 13,
+                    "consumer_app_id": 552500,
+                    "time_updated": 1
+                }]
+            }}
+            """;
+        var parsed = SteamWebApiClient.ParseResponse(json, new ulong[] { 999 });
+        Assert.Equal(13,     parsed[999].FileType);
+        Assert.Equal(552500u, parsed[999].ConsumerAppId);
+    }
+
     [Fact]
     public void ParseResponse_extracts_public_item_fields()
     {

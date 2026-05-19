@@ -105,6 +105,22 @@ public sealed class SteamWebApiClient
         return dict;
     }
 
+    /// <summary>
+    /// Filter a sub-list down to "real mods for the given app." Steam's
+    /// <c>myworkshopfiles?appid=N</c> URL filter is loose, so controller configs
+    /// (file_type 13), cross-game items (consumer_app_id mismatch), and localization-key
+    /// placeholders (title starts with `#Library_*` etc.) leak in. This is the canonical
+    /// "is this a mod the user actually wants to see?" predicate.
+    /// </summary>
+    public static bool IsMod(WorkshopItemRemote remote, uint expectedAppId)
+    {
+        if (remote.ApiResult != 1) return false;
+        if (remote.FileType is not null && remote.FileType != 0 && remote.FileType != 7) return false;
+        if (remote.ConsumerAppId is not null && remote.ConsumerAppId != expectedAppId) return false;
+        if (!string.IsNullOrEmpty(remote.Title) && remote.Title.StartsWith('#')) return false;
+        return true;
+    }
+
     // ---------- JSON shape ----------
     //
     // Confirmed live against ct (3712929235, public) and wt (3712896117, friends-only):
@@ -161,8 +177,12 @@ public sealed class SteamWebApiClient
                 var timeUpdated = TryReadLongLoose(d, "time_updated");
                 var visibility  = d.TryGetProperty("visibility", out var v) && v.TryGetInt32(out var vv) ? vv : (int?)null;
                 bool? banned    = d.TryGetProperty("banned",     out var b) && b.TryGetInt32(out var bv) ? bv != 0 : null;
+                var fileType    = d.TryGetProperty("file_type",        out var ft) && ft.TryGetInt32(out var ftv)  ? ftv  : (int?)null;
+                var consumerApp = d.TryGetProperty("consumer_app_id",  out var ca) && ca.TryGetUInt32(out var cav) ? cav  : (uint?)null;
 
-                result[id] = new WorkshopItemRemote(id, title, timeUpdated, fileSize, visibility, banned, apiResult);
+                result[id] = new WorkshopItemRemote(
+                    id, title, timeUpdated, fileSize, visibility, banned, apiResult,
+                    FileType: fileType, ConsumerAppId: consumerApp);
             }
         }
         catch (JsonException)

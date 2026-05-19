@@ -277,6 +277,13 @@
             </TabItem>
 
             <!-- ========================= TAB 2: MY MODS ========================= -->
+            <!--
+                The friend picker lives in the left sidebar. Friends added from there become
+                extra columns on the right grid: ✓ when they're subscribed, ▢ when they're not.
+                The "You" column is interactive — ✓ unsubscribes, + subscribes. Mods a friend
+                has that the local user doesn't show up as additional rows with the audit
+                columns blank ("—").
+            -->
             <TabItem Header="My Mods">
                 <Grid Margin="16">
                     <Grid.RowDefinitions>
@@ -298,87 +305,30 @@
                     </StackPanel>
 
                     <TextBlock Grid.Row="1" x:Name="MyModsHint" Foreground="#888" Margin="0,0,0,8"
-                               Text="Pick a game and click Audit. Stale rows can be refreshed individually or in bulk." />
+                               Text="Pick a game and click Audit. Add friends from the sidebar — extra columns show what they have. Click the You ✓/+ icon to (un)subscribe via Steam." />
 
-                    <DataGrid Grid.Row="2" x:Name="MyModsGrid">
-                        <DataGrid.Columns>
-                            <DataGridTemplateColumn Header="" Width="36">
-                                <DataGridTemplateColumn.CellTemplate>
-                                    <DataTemplate>
-                                        <TextBlock Text="{Binding StatusIcon}" FontSize="16" FontWeight="Bold"
-                                                   HorizontalAlignment="Center" VerticalAlignment="Center"
-                                                   Foreground="{Binding StatusText, Converter={StaticResource StatusBrush}}" />
-                                    </DataTemplate>
-                                </DataGridTemplateColumn.CellTemplate>
-                            </DataGridTemplateColumn>
-                            <DataGridTextColumn Header="Status"   Binding="{Binding StatusText}" Width="90" />
-                            <DataGridTextColumn Header="Title"    Binding="{Binding Title}"      Width="3*" />
-                            <DataGridTextColumn Header="Local"    Binding="{Binding LocalTime}"  Width="110" />
-                            <DataGridTextColumn Header="Live"     Binding="{Binding RemoteTime}" Width="110" />
-                            <DataGridTextColumn Header="Δ"        Binding="{Binding Delta}"      Width="110" />
-                            <DataGridTextColumn Header="Size"     Binding="{Binding SizeText}"   Width="80" />
-                            <DataGridTextColumn Header="ID"       Binding="{Binding PublishedFileId}" Width="120" />
-                            <DataGridTemplateColumn Header="" Width="100">
-                                <DataGridTemplateColumn.CellTemplate>
-                                    <DataTemplate>
-                                        <Button Content="Refresh" Style="{StaticResource ActionButton}"
-                                                Click="OnRefreshRowClicked"
-                                                Visibility="{Binding IsRefreshable, Converter={StaticResource BoolToVisibility}}" />
-                                    </DataTemplate>
-                                </DataGridTemplateColumn.CellTemplate>
-                            </DataGridTemplateColumn>
-                        </DataGrid.Columns>
-                    </DataGrid>
-                </Grid>
-            </TabItem>
-
-            <!-- ========================= TAB 3: COMPARE TO FRIENDS ========================= -->
-            <TabItem Header="Compare to Friends">
-                <Grid Margin="16">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                    </Grid.RowDefinitions>
-
-                    <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="Game:" VerticalAlignment="Center" />
-                        <ComboBox x:Name="FriendGameCombo" Width="320" Margin="8,0,12,0"
-                                  DisplayMemberPath="Name" SelectedValuePath="AppId" />
-                        <Button Content="Reload my subs" Style="{StaticResource ActionButton}"
-                                Click="OnReloadMySubsClicked" />
-                        <Button Content="Clear friends" Style="{StaticResource DangerButton}"
-                                Click="OnClearFriendsClicked" />
-                    </StackPanel>
-
-                    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
-                        <TextBlock Text="Or paste a SteamID64 / vanity / profile URL:" VerticalAlignment="Center" />
-                        <TextBox x:Name="FriendInput" Width="320" Margin="8,0,8,0"
-                                 KeyDown="OnFriendInputKeyDown" />
-                        <Button Content="Add" Style="{StaticResource ActionButton}" Click="OnAddFriendClicked" />
-                    </StackPanel>
-
-                    <TextBlock Grid.Row="2" x:Name="FriendsHint" Foreground="#888" Margin="0,0,0,8"
-                               Text="Pick friends from the list (★ favorites first, then online). Each added friend becomes a column. ✓ = subscribed, · = not. Their profile + Workshop subs must be Public." />
-
-                    <!-- Body: left = Steam friends picker, right = compare matrix -->
-                    <Grid Grid.Row="3">
+                    <!-- Body: left = Steam friends sidebar, right = mod grid -->
+                    <Grid Grid.Row="2">
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="320" />
+                            <ColumnDefinition Width="280" />
                             <ColumnDefinition Width="8" />
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
 
+                        <!-- Sidebar: Steam friends picker (formerly on the Compare tab) -->
                         <DockPanel Grid.Column="0">
                             <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
                                 <TextBlock Text="Steam Friends" FontWeight="SemiBold" VerticalAlignment="Center" />
-                                <Button Content="Reload"          Style="{StaticResource ActionButton}" Click="OnReloadFriendListClicked" />
-                                <Button Content="Refresh online"  Style="{StaticResource ActionButton}" Click="OnRefreshOnlineStatusClicked" />
+                                <Button Content="Reload"         Style="{StaticResource ActionButton}" Click="OnReloadFriendListClicked" />
+                                <Button Content="Refresh online" Style="{StaticResource ActionButton}" Click="OnRefreshOnlineStatusClicked" />
                             </StackPanel>
-                            <TextBlock x:Name="FriendsListHint" DockPanel.Dock="Top" Foreground="#888"
-                                       FontSize="11" Margin="0,0,0,4"
-                                       Text="Click + to add to compare. Click the star to favorite (saved between sessions)." />
+                            <TextBlock DockPanel.Dock="Top" Foreground="#888" FontSize="11" Margin="0,0,0,4"
+                                       Text="Click + to add a friend as a column on the right. Star = favorite (persists)." />
+                            <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
+                                <TextBox x:Name="FriendInput" Width="200" KeyDown="OnFriendInputKeyDown" />
+                                <Button Content="+"     Style="{StaticResource ActionButton}" Click="OnAddFriendClicked"   ToolTip="Add by SteamID / vanity / URL" />
+                                <Button Content="Clear" Style="{StaticResource DangerButton}" Click="OnClearFriendsClicked" />
+                            </StackPanel>
                             <ListBox x:Name="FriendsListBox">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
@@ -395,7 +345,7 @@
                                                        Width="18" TextAlignment="Center" VerticalAlignment="Center" />
                                             <Button DockPanel.Dock="Right" Content="+" Width="28"
                                                     Style="{StaticResource ActionButton}" Padding="0"
-                                                    Click="OnAddFriendFromListClicked" ToolTip="Add to compare" />
+                                                    Click="OnAddFriendFromListClicked" ToolTip="Add this friend as a column" />
                                             <TextBlock Text="{Binding PersonaName}" VerticalAlignment="Center"
                                                        TextTrimming="CharacterEllipsis" Margin="4,0" />
                                         </DockPanel>
@@ -404,7 +354,52 @@
                             </ListBox>
                         </DockPanel>
 
-                        <DataGrid Grid.Column="2" x:Name="FriendsGrid" />
+                        <!-- Mods grid. Friend columns get appended in code-behind whenever
+                             the friend list changes. -->
+                        <DataGrid Grid.Column="2" x:Name="MyModsGrid">
+                            <DataGrid.Columns>
+                                <!-- You: interactive toggle. ✓ = subscribed, + = not. -->
+                                <DataGridTemplateColumn Header="You" Width="56">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <Button Content="{Binding YouIcon}" ToolTip="{Binding YouTooltip}"
+                                                    Click="OnYouToggleClicked"
+                                                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                    FontSize="15" FontWeight="Bold"
+                                                    Width="32" Height="26" Padding="0"
+                                                    Background="Transparent" BorderThickness="1"
+                                                    BorderBrush="#444"
+                                                    Cursor="Hand" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTemplateColumn Header="" Width="36">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding StatusIcon}" FontSize="16" FontWeight="Bold"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                       Foreground="{Binding StatusText, Converter={StaticResource StatusBrush}}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTextColumn Header="Status"   Binding="{Binding StatusText}" Width="90" />
+                                <DataGridTextColumn Header="Title"    Binding="{Binding Title}"      Width="3*" />
+                                <DataGridTextColumn Header="Local"    Binding="{Binding LocalTime}"  Width="100" />
+                                <DataGridTextColumn Header="Live"     Binding="{Binding RemoteTime}" Width="100" />
+                                <DataGridTextColumn Header="Δ"        Binding="{Binding Delta}"      Width="100" />
+                                <DataGridTextColumn Header="Size"     Binding="{Binding SizeText}"   Width="80" />
+                                <DataGridTextColumn Header="ID"       Binding="{Binding PublishedFileId}" Width="120" />
+                                <DataGridTemplateColumn Header="" Width="100">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <Button Content="Refresh" Style="{StaticResource ActionButton}"
+                                                    Click="OnRefreshRowClicked"
+                                                    Visibility="{Binding IsRefreshable, Converter={StaticResource BoolToVisibility}}" />
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                            </DataGrid.Columns>
+                        </DataGrid>
                     </Grid>
                 </Grid>
             </TabItem>

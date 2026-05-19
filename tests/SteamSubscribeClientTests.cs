@@ -141,6 +141,25 @@ public class SteamSubscribeClientTests
     }
 
     [Fact]
+    public async Task UnsubscribeAsync_posts_to_unsubscribe_endpoint()
+    {
+        HttpRequestMessage? captured = null;
+        var http = new HttpClient(new StubHandler(req =>
+        {
+            captured = req;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            { Content = new StringContent("{\"success\":1}") });
+        }));
+
+        var client = new SteamSubscribeClient(http, FakeCookies);
+        var result = await client.UnsubscribeAsync(552500, 3712929235);
+
+        Assert.True(result.Success);
+        Assert.NotNull(captured);
+        Assert.Equal("https://steamcommunity.com/sharedfiles/unsubscribe", captured!.RequestUri!.AbsoluteUri);
+    }
+
+    [Fact]
     public async Task SubscribeAsync_handles_HttpRequestException()
     {
         var http = new HttpClient(new ThrowingHandler(new HttpRequestException("dns failed")));

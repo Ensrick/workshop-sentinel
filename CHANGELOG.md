@@ -5,6 +5,51 @@ All notable changes to Workshop Sentinel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-19
+
+### Changed — single-tab friend compare, interactive You-column toggle
+
+The Compare to Friends tab is gone. The friend picker now lives as a sidebar on the My Mods tab, and the comparison columns appear alongside your existing audit grid. Single page, no tab-switching to make sense of the matrix.
+
+The **You** column at the left of the grid is now an interactive toggle:
+- **✓** when subscribed → click to unsubscribe
+- **+** when not subscribed → click to subscribe
+Hover tooltip telegraphs the action ("Subscribed. Click to unsubscribe." / "Not subscribed. Click to subscribe."). Click POSTs to `steamcommunity.com/sharedfiles/(un)subscribe` via the existing CEF-cookie flow.
+
+Friend columns are read-only:
+- **✓** = they're subscribed
+- **▢** = they're not (dimmed grey, low visual weight)
+
+Mods a friend has that you don't are added to the same grid as new rows with the audit columns blank ("—") and the You column showing **+**. One click subscribes you. This is the workflow you can sit in Discord and walk through together — both players have the same view of who has what.
+
+### Fixed — garbage Workshop items leaking into the matrix
+
+Friend's sub list was rendering `#Library_ControllerSaveDefaultTitle` and similar — these are Steam Controller config "Workshop items" that Steam's `?appid=N` URL filter doesn't strip. Added `SteamWebApiClient.IsMod(remote, appId)` predicate that drops:
+
+- `file_type != 0 && file_type != 7` (controller bindings = 13, screenshots = 5, collections = 2, etc.)
+- titles starting with `#` (Steam localization-key placeholders, never user-visible mod titles)
+- `consumer_app_id` mismatches with the selected game
+
+Captured two new fields on `WorkshopItemRemote`: `FileType` and `ConsumerAppId`. Applied the filter at the union-build step in `AuditSelectedGameAsync`.
+
+### Added — `SteamSubscribeClient.UnsubscribeAsync`
+
+Mirror of `SubscribeAsync` against `steamcommunity.com/sharedfiles/unsubscribe`. Same wire format (id+appid+sessionid form body, same auth cookies, same `{"success":1}` parse). Powers the You-column's ✓→+ direction.
+
+### Implementation notes
+
+- New `AuditedItemRow` constructor for friend-exclusive rows: `new AuditedItemRow(publishedFileId, remote)` sets `Mine=false`, `Source=null`, all audit columns return "—". Existing audit-row construction unchanged.
+- `AuditedItemRow.YouIcon` / `YouTooltip` drive the You-cell binding. `Mine` is a notifying property — flipping it via the toggle re-renders the cell instantly without a full audit cycle.
+- `FriendHas: Dictionary<string, bool>` + a `string this[string key]` indexer let friend columns bind via `[fSTEAMID]` paths (returns `"✓"` or `"▢"`).
+- `RebuildFriendColumns` runs after each audit + on friend add/remove. Friend column headers are prefixed with a LEFT-TO-RIGHT MARK (`‎`) so the rebuild can distinguish them from the static XAML columns without a separate column-tag mechanism.
+- Static friend cell style uses a `DataTrigger` on `RelativeSource Self → Text` to dim `▢` cells to `#444444`. Cells displaying `✓` get the default light color.
+- Deleted from XAML: the entire Compare to Friends `TabItem` (75 lines), `FriendGameCombo`, `FriendsGrid`. The friends ListBox + Add/Clear controls move into the My Mods left sidebar.
+- Deleted from code-behind: `RebuildFriendsCompareAsync`, `OnReloadMySubsClicked`, `MakeMarkColumn`, `MakeCenteredStyle`, `MakeSubscribeColumn`, `OnSubscribeRowClicked`, `EmptyStringToVisibilityConverter`, `FormatSize` (~200 lines). Logic absorbed into the unified `AuditSelectedGameAsync` + new `OnYouToggleClicked`.
+
+### Test coverage
+
+134 passing (8 new): 6 `SteamWebApiClient.IsMod` predicate cases (regular mod / file_type 13 / `#`-prefix title / cross-game / null fields / API-result≠1) + `ParseResponse` capture of `file_type` & `consumer_app_id` + `UnsubscribeAsync` endpoint routing.
+
 ## [0.3.0] — 2026-05-19
 
 ### Added — per-row Subscribe button on the friend-compare tab

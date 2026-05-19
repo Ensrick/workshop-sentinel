@@ -22,19 +22,21 @@ public sealed record SubscribeResult(
     string?          ErrorDetail);
 
 /// <summary>
-/// POSTs to <c>steamcommunity.com/sharedfiles/subscribe</c> with the live Steam session
-/// cookies, subscribing the logged-in account to a Workshop item. Verified working
+/// POSTs to <c>steamcommunity.com/sharedfiles/subscribe</c> (and the symmetric
+/// <c>/unsubscribe</c>) with the live Steam session cookies. Verified working
 /// 2026-05-17 against the live Steam community endpoint (PC-B). The server-side
-/// subscription is immediate; the Steam client's local <c>appworkshop_&lt;appid&gt;.acf</c>
-/// updates on the next client-side sync (Steam restart, or ~10 min sub-monitor tick).
+/// (un)subscription is immediate; the Steam client's local
+/// <c>appworkshop_&lt;appid&gt;.acf</c> updates on the next client-side sync (Steam
+/// restart, or ~10 min sub-monitor tick).
 ///
-/// Friends-only items subscribe fine via this path as long as the consumer account is
-/// friends with the owner — authentication is by Steam JWT in <c>steamLoginSecure</c>,
+/// Friends-only items (un)subscribe fine via this path as long as the consumer account
+/// is friends with the owner — authentication is by Steam JWT in <c>steamLoginSecure</c>,
 /// not by Web API key, so visibility-on-friend rules apply normally.
 /// </summary>
 public sealed class SteamSubscribeClient
 {
-    private const string Endpoint = "https://steamcommunity.com/sharedfiles/subscribe";
+    private const string SubscribeEndpoint   = "https://steamcommunity.com/sharedfiles/subscribe";
+    private const string UnsubscribeEndpoint = "https://steamcommunity.com/sharedfiles/unsubscribe";
 
     private readonly HttpClient _http;
     private readonly SteamSessionCookies _cookies;
@@ -48,12 +50,25 @@ public sealed class SteamSubscribeClient
     /// <summary>
     /// Subscribe the current account to a single published Workshop item.
     /// </summary>
-    public async Task<SubscribeResult> SubscribeAsync(
+    public Task<SubscribeResult> SubscribeAsync(
         uint appId, ulong publishedFileId, CancellationToken ct = default)
+        => PostAsync(SubscribeEndpoint, appId, publishedFileId, ct);
+
+    /// <summary>
+    /// Unsubscribe the current account from a single Workshop item. Same wire format as
+    /// subscribe; Steam returns <c>{"success":1}</c> on accept. Steam will then queue a
+    /// local-content removal on the next sub-monitor tick.
+    /// </summary>
+    public Task<SubscribeResult> UnsubscribeAsync(
+        uint appId, ulong publishedFileId, CancellationToken ct = default)
+        => PostAsync(UnsubscribeEndpoint, appId, publishedFileId, ct);
+
+    private async Task<SubscribeResult> PostAsync(
+        string endpoint, uint appId, ulong publishedFileId, CancellationToken ct)
     {
         var body = $"id={publishedFileId}&appid={appId}&sessionid={Uri.EscapeDataString(_cookies.SessionId)}";
 
-        using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint)
+        using var req = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
             Content = new StringContent(body, System.Text.Encoding.UTF8, "application/x-www-form-urlencoded"),
         };

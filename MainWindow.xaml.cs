@@ -155,14 +155,12 @@ public partial class MainWindow : Window
             });
         }
 
-        // Refresh the game dropdowns in the other tabs.
+        // Refresh the My Mods game dropdown.
         var snapshot = _games.ToList();
         MyModsGameCombo.ItemsSource = snapshot;
-        FriendGameCombo.ItemsSource = snapshot;
         if (snapshot.Count > 0)
         {
             MyModsGameCombo.SelectedIndex = 0;
-            FriendGameCombo.SelectedIndex = 0;
         }
 
         var totalStale = _games.Sum(g => g.StaleCount);
@@ -209,21 +207,49 @@ public partial class MainWindow : Window
         var locals = await Task.Run(() =>
             _enumerator.EnumerateForApp(_libraryRoots, appId).ToList());
         _myModsRaw = locals;
+        var mineSet = locals.Select(l => l.PublishedFileId).ToHashSet();
 
-        if (locals.Count == 0)
+        // Union: my IDs + every added friend's subs. Each ID gets one row.
+        var allIds = new HashSet<ulong>(mineSet);
+        foreach (var sub in _friendSubs.Values) allIds.UnionWith(sub);
+        if (allIds.Count == 0)
         {
-            SetStatus("No subscriptions for this game.");
+            RebuildFriendColumns();
+            SetStatus("No subscriptions for this game (yours or friends').");
             return;
         }
 
-        var remotes = await _api.GetPublishedFileDetailsAsync(locals.Select(l => l.PublishedFileId));
+        var remotes = await _api.GetPublishedFileDetailsAsync(allIds);
 
-        var rows = locals
-            .Select(l => new AuditedItemRow(StalenessAuditor.Audit(
-                l,
-                remotes.TryGetValue(l.PublishedFileId, out var r) ? r : null,
-                _names.Resolve(appId))))
-            .OrderBy(r => r.Source.Status switch
+        var rows = new List<AuditedItemRow>(allIds.Count);
+        foreach (var id in allIds)
+        {
+            remotes.TryGetValue(id, out var remote);
+            // Filter non-mod items: controller configs, cross-game leaks, localization-key
+            // placeholders ("#Library_..." titles). Keeps the matrix focused on real mods
+            // for the selected game.
+            if (remote is not null && !SteamWebApiClient.IsMod(remote, appId)) continue;
+
+            AuditedItemRow row;
+            if (mineSet.Contains(id))
+            {
+                var local = locals.First(l => l.PublishedFileId == id);
+                row = new AuditedItemRow(StalenessAuditor.Audit(local, remote, _names.Resolve(appId)));
+            }
+            else
+            {
+                // Friend-exclusive mod: audit columns blank, Mine=false, You shows "+".
+                row = new AuditedItemRow(id, remote);
+            }
+            foreach (var f in _friends)
+                row.FriendHas[f.SteamId64] = _friendSubs[f.SteamId64].Contains(id);
+            rows.Add(row);
+        }
+
+        // Sort: mine first by staleness, then friend-exclusive by title.
+        rows = rows
+            .OrderBy(r => r.Mine ? 0 : 1)
+            .ThenBy(r => r.Source?.Status switch
             {
                 FreshnessStatus.Stale     => 0,
                 FreshnessStatus.ApiFailed => 1,
@@ -237,13 +263,74 @@ public partial class MainWindow : Window
 
         foreach (var r in rows) _myMods.Add(r);
 
-        var stale = rows.Count(r => r.Source.Status == FreshnessStatus.Stale);
-        SetStatus($"{locals.Count} subscribed · {stale} stale · {rows.Count(r => r.Source.Status == FreshnessStatus.Current)} current.");
+        // Build the friend columns AFTER rows are in place so the indexer bindings resolve.
+        RebuildFriendColumns();
+
+        var mine     = rows.Count(r => r.Mine);
+        var stale    = rows.Count(r => r.Mine && r.Source?.Status == FreshnessStatus.Stale);
+        var current  = rows.Count(r => r.Mine && r.Source?.Status == FreshnessStatus.Current);
+        var theirs   = rows.Count - mine;
+        var friendCt = _friends.Count;
+        SetStatus(friendCt == 0
+            ? $"{mine} subscribed · {stale} stale · {current} current."
+            : $"{mine} yours ({stale} stale, {current} current) + {theirs} from {friendCt} friend(s).");
+    }
+
+    /// <summary>
+    /// Rebuild the dynamic friend columns on MyModsGrid. Static columns (You, Status,
+    /// Title, etc.) are defined in XAML and never touched; we only manage the columns
+    /// that get appended for each added friend.
+    /// </summary>
+    private void RebuildFriendColumns()
+    {
+        // Drop any prior friend columns. We mark them with a Tag so we can find them
+        // without disturbing the static XAML-defined columns.
+        for (int i = MyModsGrid.Columns.Count - 1; i >= 0; i--)
+        {
+            if (MyModsGrid.Columns[i].Header is string h && h.StartsWith("‎", StringComparison.Ordinal))
+                MyModsGrid.Columns.RemoveAt(i);
+        }
+        foreach (var f in _friends)
+        {
+            // Prefix with LEFT-TO-RIGHT MARK (‎) as our "friend column" sentinel —
+            // invisible in the UI but distinguishes from any user-named static column.
+            var header = "‎" + (f.DisplayName ?? f.VanitySlug ?? f.SteamId64);
+            var col = new DataGridTextColumn
+            {
+                Header       = header,
+                Binding      = new Binding($"[f{f.SteamId64}]"),
+                Width        = new DataGridLength(90),
+                ElementStyle = MakeFriendCellStyle(),
+            };
+            MyModsGrid.Columns.Add(col);
+        }
+    }
+
+    private static Style MakeFriendCellStyle()
+    {
+        // ✓ in normal color, ▢ (empty box) dimmed grey — communicates "they don't have it"
+        // without the visual weight of "·". Trigger swaps foreground based on the cell's
+        // own rendered text (relative-source-self), so we can re-use the indexer binding.
+        var s = new Style(typeof(System.Windows.Controls.TextBlock));
+        s.Setters.Add(new Setter(System.Windows.Controls.TextBlock.HorizontalAlignmentProperty, HorizontalAlignment.Center));
+        s.Setters.Add(new Setter(System.Windows.Controls.TextBlock.FontSizeProperty, 15.0));
+        var trigger = new DataTrigger
+        {
+            Binding = new Binding("Text")
+            {
+                RelativeSource = new RelativeSource(RelativeSourceMode.Self),
+            },
+            Value = "▢",
+        };
+        trigger.Setters.Add(new Setter(System.Windows.Controls.TextBlock.ForegroundProperty,
+            new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x44, 0x44, 0x44))));
+        s.Triggers.Add(trigger);
+        return s;
     }
 
     private async void OnRefreshRowClicked(object sender, RoutedEventArgs e)
     {
-        if (sender is FrameworkElement fe && fe.DataContext is AuditedItemRow row)
+        if (sender is FrameworkElement fe && fe.DataContext is AuditedItemRow row && row.LocalItem is not null)
         {
             await RefreshItemsAsync(new[] { row.LocalItem });
         }
@@ -251,19 +338,21 @@ public partial class MainWindow : Window
 
     private async void OnRefreshSelectedClicked(object sender, RoutedEventArgs e)
     {
-        var rows = MyModsGrid.SelectedItems.OfType<AuditedItemRow>().ToList();
+        var rows = MyModsGrid.SelectedItems.OfType<AuditedItemRow>()
+            .Where(r => r.LocalItem is not null)
+            .ToList();
         if (rows.Count == 0)
         {
-            MessageBox.Show(this, "Select one or more rows first.", "Workshop Sentinel");
+            MessageBox.Show(this, "Select one or more of your subscribed rows first.", "Workshop Sentinel");
             return;
         }
-        await RefreshItemsAsync(rows.Select(r => r.LocalItem).ToList());
+        await RefreshItemsAsync(rows.Select(r => r.LocalItem!).ToList());
     }
 
     private async void OnRefreshAllStaleClicked(object sender, RoutedEventArgs e)
     {
-        var stale = _myMods.Where(r => r.Source.Status == FreshnessStatus.Stale)
-            .Select(r => r.LocalItem).ToList();
+        var stale = _myMods.Where(r => r.Mine && r.Source?.Status == FreshnessStatus.Stale)
+            .Select(r => r.LocalItem!).ToList();
         if (stale.Count == 0)
         {
             MessageBox.Show(this, "No stale items in this game.", "Workshop Sentinel");
@@ -277,8 +366,8 @@ public partial class MainWindow : Window
         // Friends-only / private items return result=9 from the public API, surface as Unknown.
         // The author of those mods often wants to nuke + re-pull them because the API-visible
         // staleness signal isn't available.
-        var unknown = _myMods.Where(r => r.Source.Status == FreshnessStatus.Unknown)
-            .Select(r => r.LocalItem).ToList();
+        var unknown = _myMods.Where(r => r.Mine && r.Source?.Status == FreshnessStatus.Unknown)
+            .Select(r => r.LocalItem!).ToList();
         if (unknown.Count == 0)
         {
             MessageBox.Show(this, "No friends-only (Unknown) items in this game.", "Workshop Sentinel");
@@ -289,14 +378,62 @@ public partial class MainWindow : Window
 
     private async void OnRefreshAllItemsClicked(object sender, RoutedEventArgs e)
     {
-        var all = _myMods.Where(r => r.Source.Status != FreshnessStatus.Removed)
-            .Select(r => r.LocalItem).ToList();
+        var all = _myMods.Where(r => r.Mine && r.Source?.Status != FreshnessStatus.Removed)
+            .Select(r => r.LocalItem!).ToList();
         if (all.Count == 0)
         {
             MessageBox.Show(this, "Nothing to refresh.", "Workshop Sentinel");
             return;
         }
         await RefreshItemsAsync(all);
+    }
+
+    /// <summary>
+    /// You-column toggle. ✓ → unsubscribe via Steam. + → subscribe via Steam. Steam's
+    /// server-side state flips immediately; the local ACF updates on the next client-side
+    /// sub-monitor tick. We optimistically toggle Row.Mine so the icon flips right away,
+    /// then re-audit to capture the local-state change once Steam syncs.
+    /// </summary>
+    private async void OnYouToggleClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn || btn.DataContext is not AuditedItemRow row) return;
+        if (MyModsGameCombo.SelectedValue is not uint appId) return;
+        if (!await EnsureSubscribeClientAsync()) return;
+
+        btn.IsEnabled = false;
+        try
+        {
+            SubscribeResult result;
+            if (row.Mine)
+            {
+                SetStatus($"Unsubscribing from {row.Title}…");
+                result = await _subscribeClient!.UnsubscribeAsync(appId, row.PublishedFileId);
+            }
+            else
+            {
+                SetStatus($"Subscribing to {row.Title}…");
+                result = await _subscribeClient!.SubscribeAsync(appId, row.PublishedFileId);
+            }
+
+            if (result.Success)
+            {
+                row.Mine = !row.Mine;
+                SetStatus(row.Mine
+                    ? "Subscribed. Steam will pull this on its next sub-monitor tick (~10 min) or restart."
+                    : "Unsubscribed. Steam will reconcile local content on its next sync.");
+            }
+            else
+            {
+                MessageBox.Show(this,
+                    $"{(row.Mine ? "Unsubscribe" : "Subscribe")} failed: {result.Outcome}\n\n{result.ErrorDetail}",
+                    "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Warning);
+                SetStatus("Ready.");
+            }
+        }
+        finally
+        {
+            btn.IsEnabled = true;
+        }
     }
 
     private async Task RefreshItemsAsync(IReadOnlyList<WorkshopItemLocal> items)
@@ -342,16 +479,8 @@ public partial class MainWindow : Window
         await AuditSelectedGameAsync(force: true);
     }
 
-    private static string FormatSize(long bytes)
-    {
-        if (bytes < 1024)        return $"{bytes} B";
-        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
-        if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
-        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
-    }
-
     // ===================================================================
-    //  Friends Compare tab
+    //  Friend picker (sidebar on My Mods)
     // ===================================================================
 
     private async void OnAddFriendClicked(object sender, RoutedEventArgs e)
@@ -366,7 +495,7 @@ public partial class MainWindow : Window
     {
         var raw = FriendInput.Text?.Trim();
         if (string.IsNullOrWhiteSpace(raw)) return;
-        if (FriendGameCombo.SelectedValue is not uint appId)
+        if (MyModsGameCombo.SelectedValue is not uint appId)
         {
             MessageBox.Show(this, "Pick a game first.", "Workshop Sentinel");
             return;
@@ -410,103 +539,17 @@ public partial class MainWindow : Window
         _friendSubs[friend.SteamId64] = new HashSet<ulong>(sub.PublishedFileIds);
         FriendInput.Clear();
 
-        await RebuildFriendsCompareAsync();
+        await AuditSelectedGameAsync(force: true);
     }
 
     private async void OnClearFriendsClicked(object sender, RoutedEventArgs e)
     {
         _friends.Clear();
         _friendSubs.Clear();
-        await RebuildFriendsCompareAsync();
+        await AuditSelectedGameAsync(force: true);
     }
 
-    private async void OnReloadMySubsClicked(object sender, RoutedEventArgs e)
-        => await RebuildFriendsCompareAsync();
-
-    private async Task RebuildFriendsCompareAsync()
-    {
-        if (FriendGameCombo.SelectedValue is not uint appId)
-        {
-            FriendsGrid.ItemsSource = null;
-            return;
-        }
-
-        SetStatus($"Building compare view for {_names.Resolve(appId)}…");
-
-        // My local subs for this game.
-        var myLocals = await Task.Run(() =>
-            _enumerator.EnumerateForApp(_libraryRoots, appId).ToList());
-        var mineSet  = myLocals.Select(l => l.PublishedFileId).ToHashSet();
-
-        // Union of every publishedfileid across me + every added friend.
-        var allIds = new HashSet<ulong>(mineSet);
-        foreach (var sub in _friendSubs.Values) allIds.UnionWith(sub);
-        if (allIds.Count == 0)
-        {
-            FriendsGrid.ItemsSource = null;
-            FriendsGrid.Columns.Clear();
-            SetStatus("No items in the union — add a friend or pick a different game.");
-            return;
-        }
-
-        // Fetch titles for every ID in the union (so the grid shows names, not bare numbers).
-        var remotes = await _api.GetPublishedFileDetailsAsync(allIds);
-
-        // Rebuild columns. First = mod title, then "You", then one per friend.
-        FriendsGrid.Columns.Clear();
-        FriendsGrid.ItemsSource = null;
-        FriendsGrid.Columns.Add(new DataGridTextColumn
-        {
-            Header  = "Mod",
-            Binding = new Binding("[Title]"),
-            Width   = new DataGridLength(3, DataGridLengthUnitType.Star),
-        });
-        FriendsGrid.Columns.Add(new DataGridTextColumn
-        {
-            Header  = "ID",
-            Binding = new Binding("[Id]"),
-            Width   = new DataGridLength(120),
-        });
-        FriendsGrid.Columns.Add(MakeMarkColumn("You", "[You]"));
-        foreach (var f in _friends)
-        {
-            FriendsGrid.Columns.Add(MakeMarkColumn(
-                f.DisplayName ?? f.VanitySlug ?? f.SteamId64,
-                $"[f{f.SteamId64}]"));
-        }
-        // Action column: per-row Subscribe button shown only when the local user doesn't
-        // already own the mod. Click POSTs to Steam with the user's CEF cookies.
-        FriendsGrid.Columns.Add(MakeSubscribeColumn());
-
-        // Build rows. Use a Dictionary<string,string> per row so column bindings can be string-keyed.
-        var rows = allIds
-            .Select(id =>
-            {
-                remotes.TryGetValue(id, out var r);
-                var d = new Dictionary<string, string>
-                {
-                    ["Title"] = r?.Title ?? $"#{id}",
-                    ["Id"]    = id.ToString(),
-                    ["You"]   = mineSet.Contains(id) ? "✓" : "·",
-                };
-                foreach (var f in _friends)
-                {
-                    d[$"f{f.SteamId64}"] = _friendSubs[f.SteamId64].Contains(id) ? "✓" : "·";
-                }
-                // Action: empty when the user already owns it (button hidden) or no friend
-                // has it (no reason to subscribe); "Subscribe" otherwise.
-                var anyFriendHas = _friends.Any(f => _friendSubs[f.SteamId64].Contains(id));
-                d["Action"] = (!mineSet.Contains(id) && anyFriendHas) ? "Subscribe" : "";
-                return d;
-            })
-            .OrderBy(d => d["Title"], StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        FriendsGrid.ItemsSource = rows;
-        SetStatus($"{rows.Count} mod(s) across you + {_friends.Count} friend(s).");
-    }
-
-    // --- Steam friends picker (left panel of Compare tab) ---
+    // --- Steam friends picker (sidebar on My Mods) ---
 
     private void ReloadFriendRoster()
     {
@@ -584,7 +627,7 @@ public partial class MainWindow : Window
     private async void OnAddFriendFromListClicked(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement fe || fe.DataContext is not FriendRow row) return;
-        if (FriendGameCombo.SelectedValue is not uint appId)
+        if (MyModsGameCombo.SelectedValue is not uint appId)
         {
             MessageBox.Show(this, "Pick a game first.", "Workshop Sentinel");
             return;
@@ -619,91 +662,7 @@ public partial class MainWindow : Window
 
         _friends.Add(friend);
         _friendSubs[friend.SteamId64] = new HashSet<ulong>(sub.PublishedFileIds);
-        await RebuildFriendsCompareAsync();
-    }
-
-    private static DataGridTextColumn MakeMarkColumn(string header, string indexerPath)
-    {
-        return new DataGridTextColumn
-        {
-            Header              = header,
-            Binding             = new Binding(indexerPath),
-            Width               = new DataGridLength(110),
-            ElementStyle        = MakeCenteredStyle(),
-        };
-    }
-
-    private static Style MakeCenteredStyle()
-    {
-        var s = new Style(typeof(TextBlock));
-        s.Setters.Add(new Setter(TextBlock.HorizontalAlignmentProperty, HorizontalAlignment.Center));
-        s.Setters.Add(new Setter(TextBlock.FontSizeProperty, 15.0));
-        return s;
-    }
-
-    /// <summary>
-    /// Per-row Subscribe button. The cell is empty for mods the local user already owns
-    /// (`[You]` == "✓") and a clickable "Subscribe" button otherwise. Click handler reads
-    /// Steam's CEF cookies, POSTs to steamcommunity.com/sharedfiles/subscribe, and on
-    /// success updates the row's `[You]` to "↻" so the user sees immediate feedback —
-    /// Steam's local ACF doesn't actually flip to "✓" until its next sub-monitor tick.
-    /// </summary>
-    private DataGridTemplateColumn MakeSubscribeColumn()
-    {
-        var template = new DataTemplate();
-        var btn = new FrameworkElementFactory(typeof(Button));
-        btn.SetBinding(Button.ContentProperty, new Binding("[Action]"));
-        btn.SetValue(Button.PaddingProperty, new Thickness(8, 2, 8, 2));
-        // Hide for owned rows: when [Action] is empty string the button collapses cleanly.
-        btn.SetBinding(Button.VisibilityProperty, new Binding("[Action]")
-        {
-            Converter = new EmptyStringToVisibilityConverter(),
-        });
-        btn.AddHandler(Button.ClickEvent, new RoutedEventHandler(OnSubscribeRowClicked));
-        template.VisualTree = btn;
-        return new DataGridTemplateColumn
-        {
-            Header       = "Action",
-            CellTemplate = template,
-            Width        = new DataGridLength(130),
-        };
-    }
-
-    private async void OnSubscribeRowClicked(object sender, RoutedEventArgs e)
-    {
-        if (sender is not Button btn || btn.DataContext is not Dictionary<string, string> row)
-            return;
-        if (!ulong.TryParse(row["Id"], out var publishedFileId)) return;
-        if (FriendGameCombo.SelectedValue is not uint appId) return;
-
-        // Lazy-acquire cookies (one DPAPI/SQLite read covers every subscribe in the session).
-        if (!await EnsureSubscribeClientAsync()) return;
-
-        btn.IsEnabled = false;
-        var prevContent = btn.Content;
-        btn.Content = "…";
-        SetStatus($"Subscribing to {row["Title"]} ({publishedFileId})…");
-        var result = await _subscribeClient!.SubscribeAsync(appId, publishedFileId);
-
-        if (result.Success)
-        {
-            row["Action"] = "";
-            row["You"]    = "↻";   // pending Steam-client sync; not yet "✓"
-            // Force the grid to re-render this row by reassigning the same source.
-            var src = FriendsGrid.ItemsSource;
-            FriendsGrid.ItemsSource = null;
-            FriendsGrid.ItemsSource = src;
-            SetStatus($"Subscribed. Steam will pull this item on its next sub-monitor tick (~10 min) or on restart.");
-        }
-        else
-        {
-            btn.Content   = prevContent;
-            btn.IsEnabled = true;
-            MessageBox.Show(this,
-                $"Subscribe failed: {result.Outcome}\n\n{result.ErrorDetail}",
-                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Warning);
-            SetStatus("Ready.");
-        }
+        await AuditSelectedGameAsync(force: true);
     }
 
     /// <summary>
@@ -737,15 +696,6 @@ public partial class MainWindow : Window
         }
         _subscribeClient = new SteamSubscribeClient(_http, cookieResult.Cookies);
         return true;
-    }
-
-    /// <summary>Hides the Subscribe button when its bound `[Action]` is empty string.</summary>
-    private sealed class EmptyStringToVisibilityConverter : IValueConverter
-    {
-        public object Convert(object value, Type targetType, object? parameter, CultureInfo culture)
-            => string.IsNullOrEmpty(value as string) ? Visibility.Collapsed : Visibility.Visible;
-        public object ConvertBack(object value, Type targetType, object? parameter, CultureInfo culture)
-            => throw new NotSupportedException();
     }
 
     // ===================================================================

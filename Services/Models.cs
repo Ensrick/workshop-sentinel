@@ -14,6 +14,16 @@ public sealed record WorkshopItemLocal(
 /// <summary>
 /// Remote Workshop item state, fetched from the Steam Web API. Nullable fields stay nullable
 /// when the API returns result=9 (no permission, friends-only without key).
+///
+/// <para><c>FileType</c> values that matter for filtering non-mod items out of a friend's
+/// sub list: 0=Community (the normal "user-published mod"), 13=ControllerBinding (Steam
+/// Controller config — shows up under any game's appid filter because Steam tags controller
+/// configs to the game they're for), 2=Collection, 3=Art, 5=Screenshot. Only file_type 0
+/// (and occasionally 7=Game) survives the "is this an actual mod?" filter.</para>
+///
+/// <para><c>ConsumerAppId</c> is the appid the item is *intended for*. Steam's
+/// <c>myworkshopfiles?appid=N</c> URL filter is loose — items targeting other apps still
+/// leak through. Match this against the selected game's appid to scrub them.</para>
 /// </summary>
 public sealed record WorkshopItemRemote(
     ulong   PublishedFileId,
@@ -22,7 +32,9 @@ public sealed record WorkshopItemRemote(
     long?   RemoteSizeBytes,
     int?    Visibility,          // 0=public, 1=friends, 2=private
     bool?   Banned,
-    int     ApiResult);          // 1=ok, 9=no permission, etc.
+    int     ApiResult,           // 1=ok, 9=no permission, etc.
+    int?    FileType = null,     // 0=Community/mod, 13=ControllerBinding, etc. — null when API result != 1
+    uint?   ConsumerAppId = null);
 
 public enum FreshnessStatus
 {
