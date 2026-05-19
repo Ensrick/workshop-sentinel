@@ -9,7 +9,7 @@ namespace WorkshopSentinel;
 
 public static class Program
 {
-    public const string Version = "0.3.1";
+    public const string Version = "0.3.2";
 
     [STAThread]
     public static int Main(string[] args)
