@@ -12,6 +12,19 @@ namespace WorkshopSentinel.Tests;
 
 public class FriendSubscriptionsClientTests
 {
+    // Canonical XML profile bodies for the visibility pre-flight. Mirrors what the live
+    // steamcommunity.com endpoint returns (verified 2026-05-19 by the research agent).
+    private const string PublicProfileXml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+        "<profile><steamID64>76561198211120891</steamID64><steamID><![CDATA[Ensrick]]></steamID>" +
+        "<visibilityState>3</visibilityState></profile>";
+    private const string FriendsOnlyProfileXml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+        "<profile><steamID64>76561198211120891</steamID64><visibilityState>2</visibilityState></profile>";
+    private const string PrivateProfileXml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+        "<profile><steamID64>76561198211120891</steamID64><visibilityState>1</visibilityState></profile>";
+
     [Theory]
     [InlineData("76561198211120891",                                   "76561198211120891", null)]
     [InlineData("https://steamcommunity.com/profiles/76561198211120891", "76561198211120891", null)]
@@ -25,6 +38,17 @@ public class FriendSubscriptionsClientTests
         var (sid, vanity) = FriendSubscriptionsClient.ParseIdentityInput(input);
         Assert.Equal(expectedSid, sid);
         Assert.Equal(expectedVanity, vanity);
+    }
+
+    [Theory]
+    [InlineData("<visibilityState>3</visibilityState>", ProfileVisibility.Public)]
+    [InlineData("<visibilityState>2</visibilityState>", ProfileVisibility.FriendsOnly)]
+    [InlineData("<visibilityState>1</visibilityState>", ProfileVisibility.Private)]
+    [InlineData("<visibilityState>  3  </visibilityState>", ProfileVisibility.Public)]
+    [InlineData("<profile>no field</profile>",          ProfileVisibility.Unknown)]
+    public void ParseVisibility_reads_steam_visibility_state(string xml, ProfileVisibility expected)
+    {
+        Assert.Equal(expected, FriendSubscriptionsClient.ParseVisibility(xml));
     }
 
     [Fact]
@@ -84,12 +108,13 @@ public class FriendSubscriptionsClientTests
             "<a href=\"https://steamcommunity.com/sharedfiles/filedetails/?id=333\">y</a>" +
             "</html>";
 
-        int calls = 0;
+        int scrapeCalls = 0;
         var http = new HttpClient(new StubHandler(req =>
         {
-            calls++;
+            if (IsXmlProbe(req)) return Xml(PublicProfileXml);
+            scrapeCalls++;
             // First page → data; second page → no IDs → terminate.
-            var content = calls == 1 ? page : "<html>(empty)</html>";
+            var content = scrapeCalls == 1 ? page : "<html>(empty)</html>";
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(content) };
         }));
 
@@ -99,7 +124,7 @@ public class FriendSubscriptionsClientTests
 
         Assert.Equal(FriendScrapeOutcome.Ok, result.Outcome);
         Assert.Equal(new ulong[] { 111, 222, 333 }, result.PublishedFileIds.ToArray());
-        Assert.Equal(2, calls);   // paginated until empty
+        Assert.Equal(2, scrapeCalls);   // paginated until empty
     }
 
     [Fact]
@@ -113,6 +138,7 @@ public class FriendSubscriptionsClientTests
         };
         var http = new HttpClient(new StubHandler(req =>
         {
+            if (IsXmlProbe(req)) return Xml(PublicProfileXml);
             var url = req.RequestUri!.Query;
             var page = int.Parse(System.Text.RegularExpressions.Regex.Match(url, @"p=(\d+)").Groups[1].Value);
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(pages[page]) };
@@ -127,13 +153,34 @@ public class FriendSubscriptionsClientTests
     }
 
     [Fact]
-    public async Task FetchSubscriptionsAsync_flags_private_profile()
+    public async Task FetchSubscriptionsAsync_flags_friends_only_profile_via_xml_probe()
     {
-        var http = new HttpClient(new StubHandler(_ =>
-            new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent("This profile is private — sorry"),
-            }));
+        // The whole point of the new privacy detection: a friends-only profile is detected
+        // by visibilityState=2 in the XML, NOT by any HTML phrase. Modern Steam renders
+        // public-with-zero-subs and friends-only-with-hidden-subs identically in HTML.
+        var http = new HttpClient(new StubHandler(req =>
+        {
+            if (IsXmlProbe(req)) return Xml(FriendsOnlyProfileXml);
+            // If the client even tries to scrape after seeing FriendsOnly, that's a bug.
+            throw new InvalidOperationException("Should not scrape subs page on FriendsOnly profile.");
+        }));
+
+        var client = new FriendSubscriptionsClient(http);
+        var friend = new FriendIdentity("76561198211120891", null, null);
+        var result = await client.FetchSubscriptionsAsync(friend, appId: 552500);
+        Assert.Equal(FriendScrapeOutcome.ProfilePrivate, result.Outcome);
+        Assert.Empty(result.PublishedFileIds);
+        Assert.Contains("FriendsOnly", result.ErrorDetail ?? "");
+    }
+
+    [Fact]
+    public async Task FetchSubscriptionsAsync_flags_private_profile_via_xml_probe()
+    {
+        var http = new HttpClient(new StubHandler(req =>
+        {
+            if (IsXmlProbe(req)) return Xml(PrivateProfileXml);
+            throw new InvalidOperationException("Should not scrape subs page on Private profile.");
+        }));
 
         var client = new FriendSubscriptionsClient(http);
         var friend = new FriendIdentity("76561198211120891", null, null);
@@ -145,9 +192,12 @@ public class FriendSubscriptionsClientTests
     [Fact]
     public async Task FetchSubscriptionsAsync_returns_NoSubscriptions_when_public_but_empty()
     {
-        var http = new HttpClient(new StubHandler(_ =>
-            new HttpResponseMessage(HttpStatusCode.OK)
-            { Content = new StringContent("<html>(no items)</html>") }));
+        var http = new HttpClient(new StubHandler(req =>
+        {
+            if (IsXmlProbe(req)) return Xml(PublicProfileXml);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            { Content = new StringContent("<html>(no items)</html>") };
+        }));
 
         var client = new FriendSubscriptionsClient(http);
         var friend = new FriendIdentity("76561198211120891", null, null);
@@ -156,10 +206,13 @@ public class FriendSubscriptionsClientTests
     }
 
     [Fact]
-    public async Task FetchSubscriptionsAsync_surfaces_http_errors()
+    public async Task FetchSubscriptionsAsync_surfaces_http_errors_on_subs_page()
     {
-        var http = new HttpClient(new StubHandler(_ =>
-            new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)));
+        var http = new HttpClient(new StubHandler(req =>
+        {
+            if (IsXmlProbe(req)) return Xml(PublicProfileXml);
+            return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+        }));
 
         var client = new FriendSubscriptionsClient(http);
         var friend = new FriendIdentity("76561198211120891", null, null);
@@ -167,7 +220,34 @@ public class FriendSubscriptionsClientTests
         Assert.Equal(FriendScrapeOutcome.NetworkError, result.Outcome);
     }
 
-    // --- tiny HttpMessageHandler stub ---
+    [Fact]
+    public async Task FetchSubscriptionsAsync_proceeds_on_xml_probe_failure()
+    {
+        // Network blip on the XML probe — we don't want to false-positive as Private.
+        // Falling through to the scrape (which may itself fail or come up empty) is fine.
+        var http = new HttpClient(new StubHandler(req =>
+        {
+            if (IsXmlProbe(req)) return new HttpResponseMessage(HttpStatusCode.GatewayTimeout);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "<a href=\"https://steamcommunity.com/sharedfiles/filedetails/?id=42\">x</a>")
+            };
+        }));
+
+        var client = new FriendSubscriptionsClient(http);
+        var friend = new FriendIdentity("76561198211120891", null, null);
+        var result = await client.FetchSubscriptionsAsync(friend, appId: 552500);
+        Assert.Equal(FriendScrapeOutcome.Ok, result.Outcome);
+        Assert.Equal(new ulong[] { 42 }, result.PublishedFileIds.ToArray());
+    }
+
+    // --- helpers ---
+    private static bool IsXmlProbe(HttpRequestMessage req)
+        => req.RequestUri!.AbsoluteUri.Contains("?xml=1");
+    private static HttpResponseMessage Xml(string body)
+        => new(HttpStatusCode.OK) { Content = new StringContent(body) };
+
     private sealed class StubHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, HttpResponseMessage> _respond;

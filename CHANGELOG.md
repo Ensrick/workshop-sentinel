@@ -5,6 +5,81 @@ All notable changes to Workshop Sentinel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-19
+
+### Added — per-row Subscribe button on the friend-compare tab
+
+The Compare to Friends tab gets a new **Action** column at the right edge of the matrix. For every mod a friend has subscribed to that the local user doesn't, the cell renders a clickable **Subscribe** button. Click → Workshop Sentinel reads Steam's authenticated CEF session cookies and POSTs to `steamcommunity.com/sharedfiles/subscribe` to subscribe the local Steam account on the spot. Steam's server-side subscription is immediate; the client-side `appworkshop_<appid>.acf` updates on the next sub-monitor tick (~10 min) or on next Steam launch.
+
+This replaces the previous "look at the matrix, manually navigate to each Workshop page in a browser, click Subscribe per item" workflow that made the friend-compare tab feel like a dead-end.
+
+#### Mechanism (verified live 2026-05-17 against PC-B)
+
+1. **`Services/SteamCefCookieReader.cs`** — extracts `steamLoginSecure` + `sessionid` from Steam's CEF webhelper cookie store at `%LOCALAPPDATA%\Steam\htmlcache\`. Pipeline: read `Local State` JSON → DPAPI-unwrap the `os_crypt.encrypted_key` (strip the 5-byte "DPAPI" prefix, `ProtectedData.Unprotect` under `CurrentUser` scope) → 32-byte AES-256 master key. Copy the Chromium-format `Cookies` SQLite DB to temp to dodge the live-DB lock, query `WHERE host_key LIKE '%steamcommunity.com%'`, AES-GCM-decrypt each `encrypted_value` (v10/v11 format: 3-byte prefix + 12-byte IV + ciphertext + 16-byte GCM tag). Returns a structured `(Outcome, Cookies, ErrorDetail)` result so the UI can render friendly errors per failure mode (Steam not installed, Windows-user mismatch, cookies missing because the user logged out, etc.).
+2. **`Services/SteamSubscribeClient.cs`** — POSTs `id=<workshopid>&appid=<appid>&sessionid=<sessionid>` to the subscribe endpoint with `Origin`, `Referer`, `X-Requested-With: XMLHttpRequest`, and the two cookies set on a per-request `Cookie` header. Parses `{"success":1}` as Ok; any other shape as `ServerRejected` (banned item, removed, no visibility) or `MalformedResponse`. 401/403 → `AuthFailed` with a hint about re-logging into Steam.
+3. **`MainWindow.MakeSubscribeColumn` + `OnSubscribeRowClicked`** — the cookie reader runs lazily on first click (one DPAPI/SQLite read per session), then every subsequent subscribe just makes an HTTP call. On success the row's `[You]` cell flips from `·` to `↻` ("pending Steam-client sync") and the button hides; on failure a friendly dialog explains the outcome.
+
+#### Privacy detection rewrite
+
+Old `FriendSubscriptionsClient` detected private profiles by regex-matching HTML phrases like "This profile is private". Modern Steam (verified May 2026) no longer emits any of those phrases — a public-with-zero-subs page and a friends-only-with-hidden-subs page render with identical HTML. Result: the old regex never fired and private profiles silently surfaced as "0 subscriptions found." The new path **pre-flights** the XML profile endpoint (`profiles/<sid>/?xml=1`) and gates on `<visibilityState>` (3=Public, 2=FriendsOnly, 1=Private). That's a structured signal Steam guarantees and we already use for online-state. Network blips on the XML probe fall through to the scrape (so a transient timeout doesn't render as a permanent privacy false-positive).
+
+#### Files
+
+- New: `Services/SteamCefCookieReader.cs`, `Services/SteamSubscribeClient.cs`, `tests/SteamCefCookieReaderTests.cs`, `tests/SteamSubscribeClientTests.cs` (18 new unit tests covering the cookie-blob format end-to-end, DPAPI key-loading edge cases, HTTP response parsing, header/cookie wire format, and failure-mode mapping).
+- Changed: `Services/FriendSubscriptionsClient.cs` — drops `PrivateProfileRegex`, adds `ProfileVisibility` enum + `ParseVisibility` + `FetchVisibilityAsync` + `FetchSubscriptionsAsync` pre-flight. `tests/FriendSubscriptionsClientTests.cs` updated to stub both the XML probe and the scrape pages.
+- Changed: `MainWindow.xaml.cs` — `_subscribeClient` lazy field, `MakeSubscribeColumn` factory, `OnSubscribeRowClicked` handler, `EnsureSubscribeClientAsync` cookie initializer, `EmptyStringToVisibilityConverter` (hides the button on owned rows). Row data gains an `[Action]` column with "Subscribe" / "" semantics.
+- Dependency: `Microsoft.Data.Sqlite 9.0.0` — needed to read Chromium's encrypted cookie DB. Adds ~5 MB to the self-contained binary.
+
+### Changed — non-destructive Workshop refresh (the amanda fix)
+
+The "hard reset" Workshop refresh that lost amanda's 20+ VT2 mods on 2026-05-19 has been replaced with a **mutation-only** flow. `Services/RefreshExecutor.RefreshAsync` no longer deletes the local content directory. Instead it:
+
+1. Snapshots `appworkshop_<appid>.acf` to `appworkshop_<appid>.acf.workshop-sentinel.bak` (roll-back path).
+2. Mutates the ACF in place: top-level `NeedsDownload="1"` plus per-item `timeupdated="1"` and `manifest="-1"` in BOTH `WorkshopItemsInstalled.<id>` and `WorkshopItemDetails.<id>`. The per-item blocks themselves stay present; `ugchandle` and `size` are left alone. Atomic via `.workshop-sentinel.tmp` + `File.Replace`, with the same mtime-guard against mid-flight edits by Steam.
+3. Belt-and-suspenders `steam://workshop_download_item/<appid>/<itemid>` per item. If Steam ignores the URL (foreground state, sub cache, etc.), the ACF mutation still triggers Steam's sub-monitor on its next tick (~10 min) or immediately on next Steam launch.
+4. Verifies by polling each item's `timeupdated` field in the live ACF for up to 60 s. `VerifyOk` fires the moment Steam flips the sentinel back to a real Unix epoch (≥ 2020-01-01) — that's the unambiguous "Steam re-pulled" signal. `VerifyFailed` items have their outcome flipped to failed, but **their local content folder is untouched the whole time**, so failure is recoverable: try again, restart Steam, or wait for the next sub-monitor tick.
+
+### Why this fixes the amanda burn
+
+The old flow's failure mode was unrecoverable: it deleted local content, stripped the manifest, fired `steam://workshop_download_item/`, and IF Steam silently dropped the URL (which it did, 20+ times for amanda), the user was left with NO local copy AND no re-download. The new flow inverts the risk: the ACF is mutated, content stays put, and a `.bak` snapshot makes rollback trivial. Worst case is "Steam doesn't pull and I have to try again with my old copy still intact."
+
+### Implementation notes
+
+- `RefreshExecutor.MutateAcf` replaces `RefreshExecutor.RewriteAcf`. Same atomic-rename + mtime-guard semantics; mutates in-place instead of dropping subtree keys.
+- `AcfNode` gains a `SetScalar(key, value)` mutator alongside the existing `Remove(key)`.
+- `RefreshAsync` has two new optional parameters: `TimeSpan? verifyTimeout` (default 60 s; pass `TimeSpan.Zero` to opt out) and `Func<string, ulong, long>? readItemTimeUpdated` (test injection — reads `WorkshopItemsInstalled.<id>.timeupdated` from disk; tests stub it).
+- Step stages changed: BeginItem / `Snapshot` / `MutateAcf` / EmitDownloadUrl / CompleteItem / VerifyStart / VerifyOk / VerifyFailed / Skip / Error. Removed: `DeleteContent`, `RewriteAcf`.
+- `RefreshItemsAsync` in `MainWindow.xaml.cs`: dropped the "Steam is running, the delete will fail" warning (no more delete to fail) and rewrote the confirmation + completion dialogs around "marking as stale" / "Steam re-pulled" / "your content is untouched." Removed unused `SteamProcessGuard` field.
+- Tests rewritten: `MutateAcf_flips_sentinels_in_both_subtrees_and_sets_top_level_NeedsDownload`, `MutateAcf_noop_when_no_ids_match`, plus three end-to-end `RefreshAsync` tests covering the happy path, ACF-missing error, verify timeout, and verify success. The verify-failed test asserts the content directory still exists (critical for the data-loss-fix invariant).
+
+### Field-level mechanism
+
+The per-item `manifest="-1"` sentinel matches Valve's own "unset" marker (visible in the canonical `appworkshop_322330.acf` sample). The top-level `NeedsDownload="1"` is the proven trigger from the rFactor 2 community thread where users were complaining Steam re-downloaded ALL their workshop content unprompted whenever the local manifest looked invalid — exactly the behavior we want to weaponize on demand.
+
+## [0.2.2] — 2026-05-18
+
+### Added — post-refresh verification
+
+The "hard reset" Workshop refresh (`RefreshExecutor.RefreshAsync`) now has a fourth phase: after emitting the `steam://workshop_download_item/<appid>/<itemid>` nudges, poll each item's content directory for up to 30 s and emit `VerifyOk` as soon as Steam materializes new files there. Items whose dir stays empty when the window elapses get a `VerifyFailed` step and have their `RefreshOutcome.Success` flipped to false. The GUI's wrap-up dialog now distinguishes "verification failed" from generic refresh failures and tells the user exactly what to do: open Steam, navigate to each affected item's Workshop page, click Subscribed → Subscribe to bump the server-side subscription state.
+
+### Burning case
+
+On 2026-05-19 a user (amanda) ran the refresh batch on every mod in her Vermintide 2 install (~20 items). Steam silently ignored every `steam://` nudge — most likely because Steam wasn't the foreground process when the URLs fired, or because Steam's subscription cache thought "I already have these items so the URL is a no-op." All 20 content dirs stayed empty. ModManager then logged `Mod with id <X> is missing .mod file, skipping` for every workshop_id at next game launch, no `mod_script` ran, and her in-game `NetworkLookup.deus_power_up_templates` was therefore vanilla-only (~155 entries). When she rejoined a friend's lobby that had ct (Tweaker: Chaos Wastes) injecting boons up to network index 177, the friend's `rpc_shared_state_set_server_string` broadcast crashed her client at `network_lookup.lua:2514`. The refresh tool had told her "Refresh complete — Succeeded: 20" because phase 3 reported success on every steam:// emission. There was no signal at all that the actual job (Steam re-pulling content) had silently failed.
+
+Phase 4 closes that gap. Callers (GUI / CLI / library) get an honest "Succeeded" count that reflects what actually landed on disk, plus an explicit action item for the user when Steam ignored the nudge.
+
+### Implementation notes
+
+- `RefreshAsync` got two new optional parameters: `TimeSpan? verifyTimeout` (default 30 s; pass `TimeSpan.Zero` to opt out) and `Func<string, bool>? contentExists` (injectable for tests).
+- Three new step stages: `VerifyStart`, `VerifyOk`, `VerifyFailed`.
+- Polling cadence is 500 ms; the watcher drops items from its dict as they verify so a partial-success batch finishes early.
+- Two new unit tests cover both the happy and timeout paths via the injectable `contentExists` callback. Existing tests opt out via `verifyTimeout: TimeSpan.Zero` so the suite still runs in ~1 s.
+
+### Followups not in this release
+
+- **Steam-running precheck** before phase 3 — bail with a clear error if `steam.exe` isn't in the process list, since the steam:// URL is much more likely to land when Steam is already running. Considered but deferred so this release stays scope-tight on verification.
+- **Programmatic re-subscribe** — the only fully reliable trigger for a re-pull. Needs either a logged-in browser session or a Steam Web API key. Tracked for v0.3.x.
+
 ## [0.2.1] — 2026-05-18
 
 Smoke-test release verifying the v0.2.0 self-update pipeline end-to-end. No code changes vs. v0.2.0 beyond the version bump — the value of this release is purely existing as a "newer version" for v0.2.0 installs to detect, download, verify, and install. Future patches go on top.

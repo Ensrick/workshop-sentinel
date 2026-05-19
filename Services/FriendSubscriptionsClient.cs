@@ -30,6 +30,21 @@ public enum FriendScrapeOutcome
     NoSubscriptions,        // public but no public subs for this appid
 }
 
+/// <summary>
+/// Steam's structured profile visibility, parsed from `&lt;visibilityState&gt;` in the
+/// XML profile endpoint. This replaces the brittle HTML phrase regex — Steam's modern
+/// HTML renders "public profile with zero subs" and "friends-only profile with subs
+/// hidden" identically (no detectable phrase, no class name), so the only reliable
+/// signal is the XML.
+/// </summary>
+public enum ProfileVisibility
+{
+    Unknown = 0,
+    Private = 1,
+    FriendsOnly = 2,
+    Public = 3,
+}
+
 public sealed record FriendSubscriptionResult(
     FriendIdentity? Friend,
     FreshnessStatus Status,                  // unused for friends; kept for downstream uniformity
@@ -56,9 +71,10 @@ public sealed class FriendSubscriptionsClient
         new(@"<steamID64>(\d{17})</steamID64>", RegexOptions.Compiled);
     private static readonly Regex PersonaNameRegex =
         new(@"<steamID><!\[CDATA\[([^\]]*)\]\]></steamID>", RegexOptions.Compiled);
-    private static readonly Regex PrivateProfileRegex =
-        new(@"This profile is private|The specified profile could not be found|profile_private_info|This Workshop browser is hidden|This user has not set their profile to public",
-            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // visibilityState: 1=Private, 2=FriendsOnly, 3=Public. This is the structured signal —
+    // Steam's HTML can't distinguish "public/empty" from "friends-only/hidden", but the XML always can.
+    private static readonly Regex VisibilityStateRegex =
+        new(@"<visibilityState>\s*(\d+)\s*</visibilityState>", RegexOptions.Compiled);
 
     private readonly HttpClient _http;
 
@@ -101,14 +117,28 @@ public sealed class FriendSubscriptionsClient
 
     /// <summary>
     /// Fetch every published-file ID the friend is publicly subscribed to for the given
-    /// app. Paginated. On a private profile returns Outcome=ProfilePrivate with no IDs.
+    /// app. Pre-flights the XML profile endpoint to check <c>visibilityState</c> — if the
+    /// profile isn't Public (3), returns <c>ProfilePrivate</c> without paginating. This
+    /// replaces the old HTML phrase-regex private-profile detection, which produced false
+    /// negatives on modern Steam (the "Profile is private" string no longer appears in HTML).
     /// </summary>
     public async Task<FriendSubscriptionResult> FetchSubscriptionsAsync(
         FriendIdentity friend, uint appId, CancellationToken ct = default)
     {
+        // Phase 0: structured visibility probe via the XML profile endpoint.
+        var visibility = await FetchVisibilityAsync(friend.SteamId64, ct).ConfigureAwait(false);
+        if (visibility == ProfileVisibility.Private || visibility == ProfileVisibility.FriendsOnly)
+        {
+            return new FriendSubscriptionResult(
+                friend, FreshnessStatus.Unknown, FriendScrapeOutcome.ProfilePrivate,
+                Array.Empty<ulong>(),
+                $"Profile visibility is {visibility} (need Public to scrape Workshop subscriptions).");
+        }
+        // Unknown visibility (network blip on the XML probe) — proceed to scrape; we'll
+        // get a NoSubscriptions or NetworkError outcome rather than a false-positive Private.
+
         var found = new HashSet<ulong>();
         var foundOrder = new List<ulong>();
-        bool privateSeen = false;
 
         for (int page = 1; page <= MaxPages; page++)
         {
@@ -140,12 +170,6 @@ public sealed class FriendSubscriptionsClient
                     Array.Empty<ulong>(), "timeout");
             }
 
-            if (PrivateProfileRegex.IsMatch(html))
-            {
-                privateSeen = true;
-                break;
-            }
-
             int beforeCount = found.Count;
             foreach (Match m in FilePathIdRegex.Matches(html))
             {
@@ -155,12 +179,6 @@ public sealed class FriendSubscriptionsClient
             if (found.Count == beforeCount) break;   // no new IDs on this page → end of list
         }
 
-        if (privateSeen && found.Count == 0)
-        {
-            return new FriendSubscriptionResult(
-                friend, FreshnessStatus.Unknown, FriendScrapeOutcome.ProfilePrivate,
-                Array.Empty<ulong>(), "Profile or Workshop subscriptions are private.");
-        }
         if (found.Count == 0)
         {
             return new FriendSubscriptionResult(
@@ -169,6 +187,43 @@ public sealed class FriendSubscriptionsClient
         }
         return new FriendSubscriptionResult(
             friend, FreshnessStatus.Current, FriendScrapeOutcome.Ok, foundOrder, null);
+    }
+
+    /// <summary>
+    /// Probe a profile's visibility via the XML endpoint. Returns Unknown on network
+    /// failure or malformed XML — the caller treats Unknown as "proceed and hope" so a
+    /// transient blip doesn't get rendered as a permanent privacy false-positive.
+    /// </summary>
+    public async Task<ProfileVisibility> FetchVisibilityAsync(string steamId64, CancellationToken ct = default)
+    {
+        try
+        {
+            var url = $"https://steamcommunity.com/profiles/{steamId64}/?xml=1";
+            using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode) return ProfileVisibility.Unknown;
+            var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            return ParseVisibility(body);
+        }
+        catch (HttpRequestException) { return ProfileVisibility.Unknown; }
+        catch (TaskCanceledException) { return ProfileVisibility.Unknown; }
+    }
+
+    /// <summary>
+    /// Pure parser exposed for tests. Reads `&lt;visibilityState&gt;N&lt;/visibilityState&gt;`
+    /// from Steam's XML profile body. Maps: 1=Private, 2=FriendsOnly, 3=Public; everything
+    /// else is Unknown.
+    /// </summary>
+    public static ProfileVisibility ParseVisibility(string xml)
+    {
+        var m = VisibilityStateRegex.Match(xml);
+        if (!m.Success) return ProfileVisibility.Unknown;
+        return m.Groups[1].Value switch
+        {
+            "1" => ProfileVisibility.Private,
+            "2" => ProfileVisibility.FriendsOnly,
+            "3" => ProfileVisibility.Public,
+            _   => ProfileVisibility.Unknown,
+        };
     }
 
     /// <summary>

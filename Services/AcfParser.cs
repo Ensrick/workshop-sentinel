@@ -192,6 +192,18 @@ public sealed class AcfNode
         return _children.Remove(key);
     }
 
+    /// <summary>
+    /// Set a scalar child on this object node, replacing whatever was there. Throws on
+    /// scalars (programmer error). Used by RefreshExecutor to flip per-item
+    /// `timeupdated` / `manifest` to stale sentinels without dropping the parent block.
+    /// </summary>
+    public void SetScalar(string key, string value)
+    {
+        if (_children is null) throw new InvalidOperationException(
+            "SetScalar called on a scalar AcfNode.");
+        _children[key] = Scalar(value);
+    }
+
     // ---------- Serializer ----------
     //
     // Steam writes ACF with a wrapper key ("AppWorkshop" / "AppState") around the root object.

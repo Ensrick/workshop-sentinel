@@ -32,6 +32,8 @@ public partial class MainWindow : Window
     private readonly AppNameResolver               _names;
     private readonly RefreshExecutor               _refresher;
     private readonly SteamFriendsResolver?         _friendsResolver;
+    /// <summary>Lazy-initialized on first Subscribe click: one cookie read covers the session.</summary>
+    private SteamSubscribeClient?                  _subscribeClient;
     private readonly UpdateChecker                 _updateChecker;
     private readonly UpdateInstaller               _updateInstaller;
     private UpdateCheckResult?                     _pendingUpdate;
@@ -301,19 +303,11 @@ public partial class MainWindow : Window
     {
         if (items.Count == 0) return;
 
-        if (_steamGuard.IsSteamRunning())
-        {
-            var resp = MessageBox.Show(this,
-                $"Steam appears to be running. The refresh will delete files inside\n" +
-                $"steamapps\\workshop\\content — Steam may hold handles on them and the\n" +
-                $"delete can fail.\n\nClose Steam, then click OK. Cancel to abort.",
-                "Steam is running", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
-            if (resp != MessageBoxResult.OK) return;
-        }
-
-        var totalBytes = items.Sum(i => i.LocalSizeBytes);
         var confirm = MessageBox.Show(this,
-            $"About to delete the local copy of {items.Count} item(s) ({FormatSize(totalBytes)}) and ask Steam to re-download.\n\nProceed?",
+            $"About to mark {items.Count} item(s) as stale in Steam's local manifest so Steam re-downloads them.\n\n" +
+            $"Your local content folder is NOT touched — if Steam doesn't respond, your existing copy stays in place.\n\n" +
+            $"Steam can stay running. The mutation triggers a re-pull within ~10 min (or immediately on next Steam launch).\n\n" +
+            $"Proceed?",
             "Confirm refresh", MessageBoxButton.OKCancel, MessageBoxImage.Question);
         if (confirm != MessageBoxResult.OK) return;
 
@@ -323,12 +317,26 @@ public partial class MainWindow : Window
 
         var ok   = outcomes.Count(o => o.Success);
         var fail = outcomes.Count - ok;
-        MessageBox.Show(this,
-            $"Refresh complete.\n\nSucceeded: {ok}\nFailed: {fail}\n\n" +
-            (fail > 0
-                ? "Failed items left a tip on the status bar. Restart Steam to confirm re-download starts."
-                : "Restart Steam (or wait for the steam:// nudges to land) to confirm re-download starts."),
-            "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Information);
+        var verifyFailures = outcomes
+            .Where(o => !o.Success && (o.Error ?? "").Contains("Verification timeout", StringComparison.Ordinal))
+            .ToList();
+        var body = $"Refresh complete.\n\nSucceeded (Steam re-pulled the content): {ok}\nFailed: {fail}\n\n";
+        if (verifyFailures.Count > 0)
+        {
+            body += $"{verifyFailures.Count} item(s) didn't verify within the window. Steam may not be running, or its " +
+                    "sub-monitor hasn't ticked yet (~10 min worst case). YOUR LOCAL CONTENT IS UNTOUCHED — the old " +
+                    "copy is still on disk. Options: start Steam (mutation triggers re-pull on launch), wait for the " +
+                    "next sub-monitor tick, or re-run the refresh.";
+        }
+        else if (fail > 0)
+        {
+            body += "Failed items left a tip on the status bar.";
+        }
+        else
+        {
+            body += "All items verified — Steam re-pulled fresh content.";
+        }
+        MessageBox.Show(this, body, "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Information);
 
         // Re-audit so the grid reflects the new state.
         await AuditSelectedGameAsync(force: true);
@@ -466,6 +474,9 @@ public partial class MainWindow : Window
                 f.DisplayName ?? f.VanitySlug ?? f.SteamId64,
                 $"[f{f.SteamId64}]"));
         }
+        // Action column: per-row Subscribe button shown only when the local user doesn't
+        // already own the mod. Click POSTs to Steam with the user's CEF cookies.
+        FriendsGrid.Columns.Add(MakeSubscribeColumn());
 
         // Build rows. Use a Dictionary<string,string> per row so column bindings can be string-keyed.
         var rows = allIds
@@ -482,6 +493,10 @@ public partial class MainWindow : Window
                 {
                     d[$"f{f.SteamId64}"] = _friendSubs[f.SteamId64].Contains(id) ? "✓" : "·";
                 }
+                // Action: empty when the user already owns it (button hidden) or no friend
+                // has it (no reason to subscribe); "Subscribe" otherwise.
+                var anyFriendHas = _friends.Any(f => _friendSubs[f.SteamId64].Contains(id));
+                d["Action"] = (!mineSet.Contains(id) && anyFriendHas) ? "Subscribe" : "";
                 return d;
             })
             .OrderBy(d => d["Title"], StringComparer.OrdinalIgnoreCase)
@@ -624,6 +639,113 @@ public partial class MainWindow : Window
         s.Setters.Add(new Setter(TextBlock.HorizontalAlignmentProperty, HorizontalAlignment.Center));
         s.Setters.Add(new Setter(TextBlock.FontSizeProperty, 15.0));
         return s;
+    }
+
+    /// <summary>
+    /// Per-row Subscribe button. The cell is empty for mods the local user already owns
+    /// (`[You]` == "✓") and a clickable "Subscribe" button otherwise. Click handler reads
+    /// Steam's CEF cookies, POSTs to steamcommunity.com/sharedfiles/subscribe, and on
+    /// success updates the row's `[You]` to "↻" so the user sees immediate feedback —
+    /// Steam's local ACF doesn't actually flip to "✓" until its next sub-monitor tick.
+    /// </summary>
+    private DataGridTemplateColumn MakeSubscribeColumn()
+    {
+        var template = new DataTemplate();
+        var btn = new FrameworkElementFactory(typeof(Button));
+        btn.SetBinding(Button.ContentProperty, new Binding("[Action]"));
+        btn.SetValue(Button.PaddingProperty, new Thickness(8, 2, 8, 2));
+        // Hide for owned rows: when [Action] is empty string the button collapses cleanly.
+        btn.SetBinding(Button.VisibilityProperty, new Binding("[Action]")
+        {
+            Converter = new EmptyStringToVisibilityConverter(),
+        });
+        btn.AddHandler(Button.ClickEvent, new RoutedEventHandler(OnSubscribeRowClicked));
+        template.VisualTree = btn;
+        return new DataGridTemplateColumn
+        {
+            Header       = "Action",
+            CellTemplate = template,
+            Width        = new DataGridLength(130),
+        };
+    }
+
+    private async void OnSubscribeRowClicked(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn || btn.DataContext is not Dictionary<string, string> row)
+            return;
+        if (!ulong.TryParse(row["Id"], out var publishedFileId)) return;
+        if (FriendGameCombo.SelectedValue is not uint appId) return;
+
+        // Lazy-acquire cookies (one DPAPI/SQLite read covers every subscribe in the session).
+        if (!await EnsureSubscribeClientAsync()) return;
+
+        btn.IsEnabled = false;
+        var prevContent = btn.Content;
+        btn.Content = "…";
+        SetStatus($"Subscribing to {row["Title"]} ({publishedFileId})…");
+        var result = await _subscribeClient!.SubscribeAsync(appId, publishedFileId);
+
+        if (result.Success)
+        {
+            row["Action"] = "";
+            row["You"]    = "↻";   // pending Steam-client sync; not yet "✓"
+            // Force the grid to re-render this row by reassigning the same source.
+            var src = FriendsGrid.ItemsSource;
+            FriendsGrid.ItemsSource = null;
+            FriendsGrid.ItemsSource = src;
+            SetStatus($"Subscribed. Steam will pull this item on its next sub-monitor tick (~10 min) or on restart.");
+        }
+        else
+        {
+            btn.Content   = prevContent;
+            btn.IsEnabled = true;
+            MessageBox.Show(this,
+                $"Subscribe failed: {result.Outcome}\n\n{result.ErrorDetail}",
+                "Workshop Sentinel", MessageBoxButton.OK, MessageBoxImage.Warning);
+            SetStatus("Ready.");
+        }
+    }
+
+    /// <summary>
+    /// Initialize the subscribe HTTP client + Steam session cookies on first use.
+    /// Surfaces a single, friendly error dialog per outcome instead of erroring per-click.
+    /// </summary>
+    private async Task<bool> EnsureSubscribeClientAsync()
+    {
+        if (_subscribeClient is not null) return true;
+        var reader = new SteamCefCookieReader();
+        var cookieResult = await Task.Run(reader.Read);
+        if (cookieResult.Outcome != SteamCefCookieOutcome.Ok || cookieResult.Cookies is null)
+        {
+            var message = cookieResult.Outcome switch
+            {
+                SteamCefCookieOutcome.SteamNotInstalled =>
+                    "Steam doesn't appear to be installed on this machine, or its htmlcache files are missing.",
+                SteamCefCookieOutcome.MasterKeyDecryptFailed =>
+                    "Couldn't decrypt Steam's cookie store. This usually means you're running Workshop Sentinel under a different Windows user than the one that owns the Steam install.",
+                SteamCefCookieOutcome.SqliteOpenFailed =>
+                    "Couldn't open Steam's cookie database. Try closing Steam fully and re-launching it once, then retry.",
+                SteamCefCookieOutcome.MissingRequiredCookies =>
+                    "Steam's cookie store doesn't have the auth cookies we need. " +
+                    "Open Steam, log in, click any Workshop page once in the overlay or library browser, then retry.",
+                _ => "Unknown cookie-read failure.",
+            };
+            MessageBox.Show(this,
+                $"{message}\n\nDetails: {cookieResult.ErrorDetail}",
+                "Steam cookies", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return false;
+        }
+        _subscribeClient = new SteamSubscribeClient(_http, cookieResult.Cookies);
+        return true;
+    }
+
+    /// <summary>Hides the Subscribe button when its bound `[Action]` is empty string.</summary>
+    private sealed class EmptyStringToVisibilityConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object? parameter, CultureInfo culture)
+            => string.IsNullOrEmpty(value as string) ? Visibility.Collapsed : Visibility.Visible;
+        public object ConvertBack(object value, Type targetType, object? parameter, CultureInfo culture)
+            => throw new NotSupportedException();
     }
 
     // ===================================================================

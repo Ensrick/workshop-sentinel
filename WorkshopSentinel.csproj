@@ -26,4 +26,11 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Steam's CEF webhelper stores cookies in a Chromium SQLite DB. SteamCefCookieReader
+         needs to query a single table; Microsoft.Data.Sqlite is the minimal-deps option
+         (one native SQLite payload + the ADO.NET wrapper). -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+  </ItemGroup>
+
 </Project>
