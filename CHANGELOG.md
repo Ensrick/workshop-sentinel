@@ -5,6 +5,22 @@ All notable changes to Workshop Sentinel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] — 2026-05-19
+
+### Changed — `UpdateChecker.CacheTtl` from 6h to 15 min
+
+v0.3.2's cache-invalidation fix handled the "user just updated, cache says they're on the old version" case. It did NOT handle the symmetric "user is on the current version, but a NEW release shipped inside the TTL window" case. Concretely: v0.3.2 launches → polls GitHub → caches `{CurrentVersion: 0.3.2, LatestVersion: 0.3.2}`. v0.3.3 ships 30 minutes later. User relaunches v0.3.2 → cache is fresh + version-matched, so `RecomputeStatus("0.3.2", "0.3.2")` returns `Latest`. No banner for ~5.5 hours of TTL.
+
+The root cause is the TTL itself being overly conservative. GitHub's unauthenticated rate limit is 60 req/hr, the app polls once per launch, and users typically launch a handful of times a day — nowhere near the cap. The 6h figure was set in v0.2.0 with "don't hammer the API" reasoning that doesn't survive contact with how the app is actually used. 15 minutes is plenty to avoid GUI stutter on repeat launches, and short enough that an iterating dev shipping two releases in a row actually reaches users without forcing them to delete the cache file by hand.
+
+### Burning case (this session)
+
+The user shipped v0.3.0 → v0.3.1 → v0.3.2 → v0.3.3 in rapid succession while iterating on the self-update flow itself. Every release pair tripped the 6h cache and required cache file deletion to test. v0.3.4 with the 15-min TTL closes the gap.
+
+### Tests
+
+Existing `UpdateCheckerTests` still passes. `CheckAsync_uses_fresh_cache_when_current_version_matches` uses a 5-minute-old cache (now safely inside the 15-min TTL); `CheckAsync_repolls_when_cache_is_stale` uses a 7-hour-old cache (still past the new TTL). 148 total.
+
 ## [0.3.3] — 2026-05-19
 
 ### Fixed — friend matrix dropping every non-public mod

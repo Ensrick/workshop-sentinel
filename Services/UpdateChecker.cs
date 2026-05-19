@@ -45,7 +45,15 @@ public sealed class UpdateChecker
 
     public const string DefaultAssetName = "WorkshopSentinel.exe";
 
-    public static readonly TimeSpan CacheTtl = TimeSpan.FromHours(6);
+    /// <summary>
+    /// How long a successful "what's the latest version?" answer is valid for. GitHub's
+    /// unauthenticated rate limit is 60 req/hr and the app polls once per launch — even at
+    /// 10 launches/day per user we're nowhere near the cap, so the cache is mostly there to
+    /// avoid stuttering the GUI on app open. 15 minutes is plenty for that and short enough
+    /// that two releases shipped back-to-back (the iterating-dev case) actually surface to
+    /// users without manual cache deletion. Was 6h; that fought a rapid-release cadence.
+    /// </summary>
+    public static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(15);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
