@@ -70,10 +70,51 @@ public sealed class SteamWebApiClientTests
     [Fact]
     public void IsMod_rejects_api_result_not_ok()
     {
-        // result=9 = friends-only/private and the API gave us no metadata. We
-        // can't tell if it's a mod; safest to drop from the visible matrix.
+        // result=9 = friends-only/private and the API gave us no metadata. IsMod
+        // returns false here — but ShouldDisplay (the matrix filter) lets these
+        // through. See ShouldDisplay tests below.
         var item = new WorkshopItemRemote(123, null, null, null, null, null, 9);
         Assert.False(SteamWebApiClient.IsMod(item, 552500));
+    }
+
+    // --- ShouldDisplay: the matrix-visibility filter ---------------------------
+    // This is the predicate AuditSelectedGameAsync actually calls. Differs from
+    // IsMod in one critical way: friends-only / API-failed items (result != 1)
+    // pass through, because the friend's public sub page already told us the ID
+    // exists and the user expects to see it. Without this, the entire matrix
+    // would collapse to just public mods we authored — exactly the bug the
+    // user reported when they added their other Steam account.
+
+    [Fact]
+    public void ShouldDisplay_passes_friends_only_result_9()
+    {
+        var item = new WorkshopItemRemote(123, null, null, null, null, null, 9);
+        Assert.True(SteamWebApiClient.ShouldDisplay(item, 552500));
+    }
+
+    [Fact]
+    public void ShouldDisplay_passes_api_failure_result_minus_1()
+    {
+        var item = new WorkshopItemRemote(123, null, null, null, null, null, -1);
+        Assert.True(SteamWebApiClient.ShouldDisplay(item, 552500));
+    }
+
+    [Fact]
+    public void ShouldDisplay_still_filters_controller_bindings_when_metadata_is_present()
+    {
+        var item = new WorkshopItemRemote(
+            123, "#Library_ControllerSaveDefaultTitle", 0, 0, 0, false, 1,
+            FileType: 13, ConsumerAppId: 552500);
+        Assert.False(SteamWebApiClient.ShouldDisplay(item, 552500));
+    }
+
+    [Fact]
+    public void ShouldDisplay_passes_regular_mod_with_full_metadata()
+    {
+        var item = new WorkshopItemRemote(
+            123, "Tweaker: Chaos Wastes", 1700000000, 1024, 0, false, 1,
+            FileType: 0, ConsumerAppId: 552500);
+        Assert.True(SteamWebApiClient.ShouldDisplay(item, 552500));
     }
 
     [Fact]

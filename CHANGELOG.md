@@ -5,6 +5,34 @@ All notable changes to Workshop Sentinel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-05-19
+
+### Fixed — friend matrix dropping every non-public mod
+
+Friends-only items (and any item where the no-key Steam Web API returns `result=9` or fails) were silently filtered out of the matrix before they hit the grid. The friend's public subscription page already gives us the published-file IDs, but the audit's `IsMod` predicate required `ApiResult == 1` to keep a row — which is the one thing friends-only items never have on the no-key endpoint. Result: when you added a friend (or your other Steam account) whose subs included your friends-only mods or mods authored by other people, those rows simply never appeared. Only your own *public* mods made it through.
+
+**Reported case:** "added myself on the other steam account to compare — only showing 3 mods that I'm subscribed to in addition to Verminious Dreams Lighting" (i.e., only ct/gt/Crafting/VDL, which happen to be the user's four public mods). wt, crt, and every mod by another author were silently swallowed.
+
+#### Fix
+
+Introduced `SteamWebApiClient.ShouldDisplay(remote, expectedAppId)` as the matrix-visibility predicate. It delegates to `IsMod` only when `ApiResult == 1` (full metadata available); for `result=9` (friends-only) and `result=-1` (failure) it lets the row through. `AuditSelectedGameAsync` switched from `IsMod` to `ShouldDisplay` at the filter site.
+
+Friends-only rows render with `#<id>` as the title and "—" in every audit column (we have no Web API metadata for them), but the friend column correctly shows ✓ and the You toggle still works to (un)subscribe.
+
+#### Follow-up not in this release
+
+Resolving real titles for friends-only items requires the authenticated `IPublishedFileService/GetDetails` endpoint with a Steam Web API key. The PLAN.md milestone calls for this and it'll land in a future release — for now you'll see `#3712896117` instead of `wt`, which is ugly but at least visible.
+
+### Fixed — can't un-add a friend column
+
+The friend roster's `+` button was add-only — once a friend's column was in the matrix, there was no way to remove it short of clicking "Clear" and re-adding everyone else.
+
+`FriendRow` now has an `IsAdded` notifying property + computed `AddButtonIcon` (`+` ↔ `−`) and `AddButtonTooltip`. `OnAddFriendFromListClicked` toggles based on current state: click `+` to add, click `−` to remove that one friend. Adding via the text-input path also flips the matching roster row's `IsAdded` so the sidebar stays in sync. "Clear" sets `IsAdded = false` on every roster row.
+
+### Tests
+
+148 passing (4 new): `ShouldDisplay_passes_friends_only_result_9`, `ShouldDisplay_passes_api_failure_result_minus_1`, `ShouldDisplay_still_filters_controller_bindings_when_metadata_is_present`, `ShouldDisplay_passes_regular_mod_with_full_metadata`.
+
 ## [0.3.2] — 2026-05-19
 
 ### Fixed — self-update cache poisoned after install (the "v0.3.0 sees itself as latest" bug)

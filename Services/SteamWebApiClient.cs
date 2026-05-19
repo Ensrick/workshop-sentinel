@@ -121,6 +121,23 @@ public sealed class SteamWebApiClient
         return true;
     }
 
+    /// <summary>
+    /// Should this row appear in the matrix? Differs from <see cref="IsMod"/> in one
+    /// important way: when the no-key API returned <c>result=9</c> (friends-only) or
+    /// <c>result=-1</c> (network failure) we have no metadata to judge by, so we err on
+    /// the side of *showing* the row. The friend's public sub-page already told us the
+    /// ID exists; the user is right to expect it in the grid. Audit columns will show
+    /// "—" and the title falls back to "#&lt;id&gt;", but the friend column still
+    /// correctly shows ✓.
+    /// <para>For result=1 (full metadata), we delegate to <see cref="IsMod"/> so controller
+    /// configs, cross-game leaks, and <c>#Library_*</c> placeholders still get stripped.</para>
+    /// </summary>
+    public static bool ShouldDisplay(WorkshopItemRemote remote, uint expectedAppId)
+    {
+        if (remote.ApiResult != 1) return true;
+        return IsMod(remote, expectedAppId);
+    }
+
     // ---------- JSON shape ----------
     //
     // Confirmed live against ct (3712929235, public) and wt (3712896117, friends-only):

@@ -343,9 +343,10 @@
                                             <TextBlock DockPanel.Dock="Left" Text="{Binding OnlineIcon}"
                                                        Foreground="{Binding OnlineColor}" FontSize="14"
                                                        Width="18" TextAlignment="Center" VerticalAlignment="Center" />
-                                            <Button DockPanel.Dock="Right" Content="+" Width="28"
+                                            <Button DockPanel.Dock="Right" Content="{Binding AddButtonIcon}" Width="28"
                                                     Style="{StaticResource ActionButton}" Padding="0"
-                                                    Click="OnAddFriendFromListClicked" ToolTip="Add this friend as a column" />
+                                                    Click="OnAddFriendFromListClicked"
+                                                    ToolTip="{Binding AddButtonTooltip}" />
                                             <TextBlock Text="{Binding PersonaName}" VerticalAlignment="Center"
                                                        TextTrimming="CharacterEllipsis" Margin="4,0" />
                                         </DockPanel>

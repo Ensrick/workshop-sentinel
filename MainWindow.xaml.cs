@@ -225,10 +225,11 @@ public partial class MainWindow : Window
         foreach (var id in allIds)
         {
             remotes.TryGetValue(id, out var remote);
-            // Filter non-mod items: controller configs, cross-game leaks, localization-key
-            // placeholders ("#Library_..." titles). Keeps the matrix focused on real mods
-            // for the selected game.
-            if (remote is not null && !SteamWebApiClient.IsMod(remote, appId)) continue;
+            // Filter non-mod items. ShouldDisplay only strips rows with positive
+            // evidence they're not mods (controller configs, cross-game leaks,
+            // localization-key titles); result=9 friends-only and result=-1 failures
+            // pass through so the user sees the friend's full subscription set.
+            if (remote is not null && !SteamWebApiClient.ShouldDisplay(remote, appId)) continue;
 
             AuditedItemRow row;
             if (mineSet.Contains(id))
@@ -537,6 +538,10 @@ public partial class MainWindow : Window
 
         _friends.Add(friend);
         _friendSubs[friend.SteamId64] = new HashSet<ulong>(sub.PublishedFileIds);
+        // Mirror the IsAdded state into the roster row if we have one — so the
+        // sidebar's +/− toggle correctly reflects "this friend is now in the matrix".
+        var rosterRow = _friendRoster.FirstOrDefault(r => r.SteamId64 == friend.SteamId64);
+        if (rosterRow is not null) rosterRow.IsAdded = true;
         FriendInput.Clear();
 
         await AuditSelectedGameAsync(force: true);
@@ -546,6 +551,7 @@ public partial class MainWindow : Window
     {
         _friends.Clear();
         _friendSubs.Clear();
+        foreach (var r in _friendRoster) r.IsAdded = false;
         await AuditSelectedGameAsync(force: true);
     }
 
@@ -627,15 +633,20 @@ public partial class MainWindow : Window
     private async void OnAddFriendFromListClicked(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement fe || fe.DataContext is not FriendRow row) return;
-        if (MyModsGameCombo.SelectedValue is not uint appId)
+
+        // Toggle: if already in the matrix, remove. Otherwise, add.
+        if (row.IsAdded)
         {
-            MessageBox.Show(this, "Pick a game first.", "Workshop Sentinel");
+            _friends.RemoveAll(f => f.SteamId64 == row.SteamId64);
+            _friendSubs.Remove(row.SteamId64);
+            row.IsAdded = false;
+            await AuditSelectedGameAsync(force: true);
             return;
         }
 
-        if (_friends.Any(f => f.SteamId64 == row.SteamId64))
+        if (MyModsGameCombo.SelectedValue is not uint appId)
         {
-            MessageBox.Show(this, $"'{row.PersonaName}' is already added.", "Workshop Sentinel");
+            MessageBox.Show(this, "Pick a game first.", "Workshop Sentinel");
             return;
         }
 
@@ -662,6 +673,7 @@ public partial class MainWindow : Window
 
         _friends.Add(friend);
         _friendSubs[friend.SteamId64] = new HashSet<ulong>(sub.PublishedFileIds);
+        row.IsAdded = true;
         await AuditSelectedGameAsync(force: true);
     }
 

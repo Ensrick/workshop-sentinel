@@ -31,6 +31,24 @@ public sealed class FriendRow : INotifyPropertyChanged
     }
     public string FavoriteIcon => Friend.IsFavorite ? "★" : "☆";
 
+    private bool _isAdded;
+    /// <summary>True when this friend's column is currently in the My Mods matrix.</summary>
+    public bool IsAdded
+    {
+        get => _isAdded;
+        set
+        {
+            if (_isAdded == value) return;
+            _isAdded = value;
+            Raise(nameof(IsAdded));
+            Raise(nameof(AddButtonIcon));
+            Raise(nameof(AddButtonTooltip));
+        }
+    }
+    /// <summary>＋ when not added, − when added — drives the per-row toggle button.</summary>
+    public string AddButtonIcon    => _isAdded ? "−" : "+";
+    public string AddButtonTooltip => _isAdded ? "Remove this friend from the matrix" : "Add this friend as a column";
+
     public FriendOnlineState Online
     {
         get => Friend.Online;
